@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Sequence
+from typing import Sequence, Optional, Tuple, List
 
 import torch
+import torchvision.transforms.functional as TF
+from PIL import Image
 from einops import rearrange
 from torchvision.io import write_video
 
@@ -196,6 +198,186 @@ def prepare_single_prompt_inputs(
         generator=generator,
     )
     return noise, prompts
+
+
+# ---------------------------------------------------------------------------
+# Image-to-Video helpers
+# ---------------------------------------------------------------------------
+
+def load_and_preprocess_image(
+    image_path: str,
+    target_width: int = 832,
+    target_height: int = 480,
+) -> Image.Image:
+    """Load an image, resize/center-crop to target dimensions.
+
+    Target dimensions are in pixel space.  They should be multiples of
+    (patch_size * vae_stride).  For Wan2.2-TI2V-5B with the default
+    LongLive config, latent shape is 48×44×80 which corresponds to
+    768×704 in pixel space.
+    """
+    img = Image.open(image_path).convert("RGB")
+    iw, ih = img.size
+
+    # Scale to fit target, maintaining aspect ratio
+    scale = max(target_width / iw, target_height / ih)
+    img = img.resize((round(iw * scale), round(ih * scale)), Image.LANCZOS)
+
+    # Center crop to exact target size
+    x1 = (img.width - target_width) // 2
+    y1 = (img.height - target_height) // 2
+    img = img.crop((x1, y1, x1 + target_width, y1 + target_height))
+
+    return img
+
+
+def image_to_tensor(img: Image.Image, device: torch.device) -> torch.Tensor:
+    """Convert PIL Image to normalised tensor on *device*.
+
+    Returns tensor of shape (3, H, W) normalised to [-1, 1].
+    """
+    tensor = TF.to_tensor(img).sub_(0.5).div_(0.5)
+    return tensor.to(device)
+
+
+def encode_image_to_latent(
+    vae_wrapper,
+    image_tensor: torch.Tensor,
+) -> torch.Tensor:
+    """Encode a single image tensor to VAE latent space.
+
+    Args:
+        vae_wrapper: ``WanVAEWrapper`` instance (``pipeline.vae``).
+        image_tensor: Shape ``(3, H, W)`` on the correct device.
+
+    Returns:
+        Tensor of shape ``(1, C, 1, h, w)`` — the first temporal dim is 1
+        because we encode a single frame.
+    """
+    # WanVAEWrapper.encode_to_latent expects (batch, C, F, H, W)
+    pixel = image_tensor.unsqueeze(0).unsqueeze(2)  # (1, 3, 1, H, W)
+    with torch.no_grad():
+        latent = vae_wrapper.encode_to_latent(pixel)  # (1, 1, C, h, w)
+    return latent
+
+
+def prepare_i2v_inputs_with_vae(
+    config,
+    prompt: str,
+    image_path: str,
+    vae,
+    device: torch.device | str,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+) -> Tuple[torch.Tensor, List[List[str]], torch.Tensor]:
+    """Prepare inputs for single-image-to-video inference (with VAE instance).
+
+    Returns:
+        (noise, prompts, initial_latent)
+        - noise:     (1, num_noise_frames, C, h, w)
+        - prompts:   [[prompt, prompt, ...]] (one per chunk)
+        - initial_latent: (1, 1, C, h, w)  — the encoded first frame
+    """
+    device = torch.device(device)
+    frames_per_block = int(getattr(config, "num_frame_per_block", 1))
+    latent_shape = list(config.image_or_video_shape[2:])  # [C, h, w]
+
+    num_noise_frames = int(getattr(config, "num_output_frames", config.image_or_video_shape[1]))
+
+    if num_noise_frames % frames_per_block != 0:
+        raise ValueError(
+            f"num_output_frames={num_noise_frames} must be divisible by "
+            f"num_frame_per_block={frames_per_block}"
+        )
+
+    num_blocks = num_noise_frames // frames_per_block
+    prompts = [[prompt] * num_blocks]
+
+    # Compute pixel size from latent shape
+    pixel_h = latent_shape[1] * 8
+    pixel_w = latent_shape[2] * 8
+
+    img = load_and_preprocess_image(image_path, target_width=pixel_w, target_height=pixel_h)
+    img_tensor = image_to_tensor(img, device)
+
+    # Encode image to latent
+    initial_latent = encode_image_to_latent(vae, img_tensor)  # (1, 1, C, h, w)
+
+    # Generate noise for the remaining frames
+    seed_g = torch.Generator(device=device)
+    seed_g.manual_seed(seed)
+    noise = torch.randn(
+        [1, num_noise_frames, *latent_shape],
+        device=device,
+        dtype=dtype,
+        generator=seed_g,
+    )
+
+    return noise, prompts, initial_latent
+
+
+def prepare_bookend_i2v_inputs(
+    config,
+    prompt: str,
+    first_frame_path: str,
+    last_frame_path: str,
+    vae,
+    device: torch.device | str,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+    seed: int = 0,
+) -> Tuple[torch.Tensor, List[List[str]], torch.Tensor]:
+    """Prepare inputs for first+last frame to video inference.
+
+    Strategy: encode first frame as initial_latent (the pipeline will inject it).
+    The last frame is used as a soft guidance target during the last chunk's
+    denoising via a simple loss term that pulls the decoded last frame toward
+    the target latent.
+
+    Returns:
+        (noise, prompts, initial_latent)
+        - noise:         (1, num_noise_frames, C, h, w)
+        - prompts:       [[prompt, prompt, ...]]
+        - initial_latent: (1, 1, C, h, w)  — the encoded first frame
+
+    Note: last_frame_latent is NOT returned here because the guidance is applied
+    inside the modified pipeline call in inference_i2v.py.
+    """
+    device = torch.device(device)
+    frames_per_block = int(getattr(config, "num_frame_per_block", 1))
+    latent_shape = list(config.image_or_video_shape[2:])
+
+    num_noise_frames = int(getattr(config, "num_output_frames", config.image_or_video_shape[1]))
+
+    if num_noise_frames % frames_per_block != 0:
+        raise ValueError(
+            f"num_output_frames={num_noise_frames} must be divisible by "
+            f"num_frame_per_block={frames_per_block}"
+        )
+
+    num_blocks = num_noise_frames // frames_per_block
+    prompts = [[prompt] * num_blocks]
+
+    pixel_h = latent_shape[1] * 8
+    pixel_w = latent_shape[2] * 8
+
+    # Encode first frame
+    img_first = load_and_preprocess_image(first_frame_path, target_width=pixel_w, target_height=pixel_h)
+    tensor_first = image_to_tensor(img_first, device)
+    initial_latent = encode_image_to_latent(vae, tensor_first)  # (1, 1, C, h, w)
+
+    # Generate noise
+    seed_g = torch.Generator(device=device)
+    seed_g.manual_seed(seed)
+    noise = torch.randn(
+        [1, num_noise_frames, *latent_shape],
+        device=device,
+        dtype=dtype,
+        generator=seed_g,
+    )
+
+    return noise, prompts, initial_latent
 
 
 def video_to_uint8(video: torch.Tensor) -> torch.Tensor:

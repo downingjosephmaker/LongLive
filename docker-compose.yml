@@ -1,0 +1,26 @@
+services:
+  longlive:
+    build:
+      context: /home/local_video/LongLive
+      dockerfile: Dockerfile
+    image: longlive:latest
+    container_name: longlive
+    ports:
+      - "19521:19521"
+    volumes:
+      - /home/docker_log/longlive/models:/models:ro
+      - /home/docker_log/longlive/prompts:/prompts:ro
+      - /home/docker_log/longlive/output:/output
+    environment:
+      - TZ=Asia/Shanghai
+      - NVIDIA_VISIBLE_DEVICES=all
+      - LONGLIVE_PUBLIC_BASE=http://127.0.0.1:19521
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    shm_size: "8g"
+    restart: unless-stopped

@@ -138,10 +138,23 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         text_prompts: List[str],
         initial_latent: Optional[torch.Tensor] = None,
         return_latents: bool = False,
-        start_frame_index: Optional[int] = 0
+        start_frame_index: Optional[int] = 0,
+        shot_anchors: Optional[List[dict]] = None,
     ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
+
+        shot_anchors (optional): list of {"chunk_index": int, "latent": Tensor}
+            entries that anchor specific chunks to a reference image latent.
+            Used for multi-shot video generation where each shot starts from
+            a distinct visual reference. The latent's first frame replaces
+            the noise at the chunk start, and the existing scene-cut
+            machinery (multi_shot_sink / RoPE offset / KV recache) takes
+            care of the temporal transition.
+
+            Caller responsibility: chunk_index must align with the chunk
+            schedule (independent_first_frame offsets the schedule by +1 if
+            initial_latent is None and the model is configured for it).
         Inputs:
             noise (torch.Tensor): The input noise tensor of shape
                 (batch_size, num_output_frames, num_channels, height, width).
@@ -300,6 +313,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 current_start_frame=current_start_frame,
                 cache_start_frame=cache_start_frame,
                 raw_prompts=raw_prompts,
+                shot_anchors=shot_anchors,
             )
         finally:
             dit.local_attn_size = prev_local_attn_size
@@ -332,7 +346,24 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         use_cfg, initial_latent, return_latents,
         current_start_frame, cache_start_frame,
         raw_prompts=None,
+        shot_anchors=None,
     ):
+        # Build a quick lookup: chunk_index -> latent tensor (1,1,C,h,w on noise.device).
+        # Stays None / empty when no multi-shot anchors are provided, so this
+        # patch is a no-op for plain T2V / single-shot I2V callers.
+        anchor_map = {}
+        if shot_anchors:
+            for entry in shot_anchors:
+                idx = entry.get("chunk_index")
+                lat = entry.get("latent")
+                if idx is None or lat is None:
+                    continue
+                # Defensive shape check: must be (B, T>=1, C, h, w) matching noise spatial dims
+                if lat.dim() != 5 or lat.shape[-3:] != noise.shape[-3:]:
+                    print(f"[inference][warn] shot_anchor at chunk={idx} dropped: "
+                          f"shape mismatch {tuple(lat.shape)} vs noise {tuple(noise.shape)}")
+                    continue
+                anchor_map[int(idx)] = lat.to(device=noise.device, dtype=noise.dtype)
 
         if initial_latent is not None:
             timestep = torch.ones([batch_size, 1], device=noise.device, dtype=torch.int64) * 0
@@ -465,6 +496,21 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 self._dit_model.rope_temporal_offset = current_shot_index * phi
                 print(f"[inference] multi-shot RoPE: shot_index={current_shot_index}, "
                       f"temporal_offset={self._dit_model.rope_temporal_offset:.4f}")
+
+            # ── Multi-shot anchor: replace first frame of this chunk with the
+            # caller-supplied reference latent. Keeps existing scene-cut KV
+            # machinery untouched; we only edit the noise tensor in-place
+            # before the slice is taken below.
+            if chunk_index in anchor_map:
+                anchor = anchor_map[chunk_index]
+                slice_start = cache_start_frame - num_input_frames
+                if 0 <= slice_start < noise.shape[1]:
+                    noise[:, slice_start:slice_start + 1] = anchor[:, :1]
+                    print(f"[inference] shot anchor injected at chunk_index={chunk_index} "
+                          f"slice_start={slice_start}")
+                else:
+                    print(f"[inference][warn] shot anchor chunk_index={chunk_index} "
+                          f"out of range (slice_start={slice_start}, noise_T={noise.shape[1]}); skipped")
 
             noisy_input = noise[
                 :, cache_start_frame - num_input_frames:cache_start_frame + current_num_frames - num_input_frames]
