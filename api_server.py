@@ -20,6 +20,7 @@ API Endpoints
   GET  /api/status                     — Server & GPU status
   GET  /api/videos                     — List generated videos
   GET  /output/{filename}              — Download generated video
+  POST /api/unload                     — Unload model to free GPU
 
 Async Mode
 ----------
@@ -28,46 +29,21 @@ immediately with `{ "status": "queued", "task_id": "..." }` and the caller
 polls `GET /api/task/{task_id}` until status is `succeeded` or `failed`.
 
 Task statuses:
-  queued     -> waiting for GPU lock (queue_position included)
-  running    -> generation in progress (progress: 0/50/100)
-  succeeded  -> video ready (video_url contains absolute URL when
-                LONGLIVE_PUBLIC_BASE is set)
-  failed     -> error in `error` field
-  cancelled  -> task was cancelled while queued
+  queued  — waiting for GPU lock
+  running — generation in progress (progress 0..100)
+  succeeded — video ready
+  failed  — error occurred
+  cancelled — cancelled before execution
 
-Multi-shot Anchoring
---------------------
-- shots[0].first_frame  -> classic I2V (encoded as `initial_latent`)
-- shots[i>0].first_frame -> encoded and injected as `shot_anchors[]` at the
-  chunk index that starts that shot. Pipeline replaces the noise tensor's
-  first frame at that chunk with the reference latent, while the existing
-  scene-cut prefix triggers `multi_shot_sink` KV recache and RoPE phase
-  offset for clean shot transitions.
-
-The api auto-prefixes shot[i>0] prompts with the scene-cut sentinel so the
-pipeline's `_is_shot_boundary` activates without callers needing to know
-the convention.
-
-Examples
---------
-  # T2V single-shot
-  {"shots": [{"prompt": "A robot walks through a lab"}]}
-
-  # I2V single-shot
-  {"shots": [{"prompt": "A robot walks", "first_frame": "/path/to/img.jpg"}]}
-
-  # Multi-shot with per-shot first-frame anchoring
-  {
-    "shots": [
-      {"prompt": "Robot stands at the lab entrance",
-       "first_frame": "/prompts/shot0.jpg", "blocks": 8},
-      {"prompt": "Robot walks to the workbench",
-       "first_frame": "/prompts/shot1.jpg", "blocks": 8},
-      {"prompt": "Robot examines a component",
-       "first_frame": "/prompts/shot2.jpg", "blocks": 8}
-    ],
-    "num_frames": 192
-  }
+Form Upload
+-----------
+  POST /api/generate/upload-v2
+    shots_json  (required) — JSON array of {prompt, first_frame?, blocks?}
+    num_frames  (optional) — int, default 128
+    seed        (optional) — int, default 0
+    fps         (optional) — int, default 24
+    async       (optional) — "true" for async mode
+    img_<ref>   (optional) — uploaded images, ref matches first_frame value
 """
 
 from __future__ import annotations
@@ -77,69 +53,126 @@ import json
 import os
 import shutil
 import sys
-import threading
 import time
 import uuid
-from collections import OrderedDict
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
-import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import (
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from omegaconf import OmegaConf
-from pydantic import BaseModel, Field
 from starlette.datastructures import UploadFile as StarletteUploadFile
+from pydantic import BaseModel, Field
 
-# Scene-cut sentinel — must match utils.dataset.DEFAULT_SCENE_CUT_PREFIX.
-# Auto-prepended to prompts of shots after the first so the pipeline's
-# `_is_shot_boundary` / `_is_scene_cut` heuristics fire and `multi_shot_sink`
-# performs the proper KV recache + RoPE offset.
-SCENE_CUT_PREFIX = "The scene transitions. "
+import uvicorn
+from omegaconf import OmegaConf
 
 # ---------------------------------------------------------------------------
-# Lazy-initialised globals
+# Paths
+# ---------------------------------------------------------------------------
+OUTPUT_DIR = Path(os.environ.get("LONGLIVE_OUTPUT", "/output"))
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+UPLOAD_DIR = Path("/tmp/longlive_uploads")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+PUBLIC_BASE = os.environ.get("LONGLIVE_PUBLIC_BASE", "").rstrip("/")
+
+# ---------------------------------------------------------------------------
+# Global state
 # ---------------------------------------------------------------------------
 _pipe = None
 _config = None
 _device = None
 
+_TASKS: Dict[str, "TaskState"] = {}
+_TASK_LOCK = asyncio.Lock()
 
-def _ensure_loaded():
-    """Load model on first call."""
-    global _pipe, _config, _device
-    if _pipe is not None:
+
+_LOADED_CONFIG_KIND: Optional[str] = None  # "t2v" | "i2v"
+
+def _ensure_loaded(kind: str = "t2v"):
+    """Load model on first call. kind selects T2V vs I2V config (different
+    independent_first_frame setting). Reload pipeline if kind changes."""
+    global _pipe, _config, _device, _LOADED_CONFIG_KIND
+    if _pipe is not None and _LOADED_CONFIG_KIND == kind:
         return
 
     sys.path.insert(0, os.getcwd())
 
     from pipeline import CausalDiffusionInferencePipeline
-    from utils.config import normalize_config, section_get
+    from utils.config import normalize_config
     from utils.inference_utils import load_generator_checkpoint, place_vae_for_streaming
 
-    config_path = os.environ.get(
-        "LONGLIVE_CONFIG",
-        "configs/inference_i2v.yaml",
-    )
+    if kind == "i2v":
+        default_cfg = "configs/inference_i2v.yaml"
+    else:
+        default_cfg = "configs/inference.yaml"
+    config_path = os.environ.get("LONGLIVE_CONFIG_" + kind.upper(), None) \
+                  or os.environ.get("LONGLIVE_CONFIG", None) \
+                  or default_cfg
+    print(f"[API] Building pipeline (kind={kind}, config={config_path})...", flush=True)
+
+    # 旧 pipeline 释放
+    if _pipe is not None:
+        del _pipe
+        _pipe = None
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
     _config = normalize_config(OmegaConf.load(config_path))
     _device = torch.device("cuda")
 
     torch.set_grad_enabled(False)
-    print("[API] Building pipeline...")
     _pipe = CausalDiffusionInferencePipeline(_config, device=_device)
 
     ckpt_path = getattr(_config, "generator_ckpt", None)
     if ckpt_path:
-        print(f"[API] Loading generator checkpoint: {ckpt_path}")
+        print(f"[API] Loading generator checkpoint: {ckpt_path}", flush=True)
         load_generator_checkpoint(_pipe.generator, ckpt_path)
 
     _pipe = _pipe.to(device=_device, dtype=torch.bfloat16)
     place_vae_for_streaming(_pipe, _config)
     _pipe.generator.model.eval().requires_grad_(False)
-    print("[API] Pipeline ready.")
+
+    # GPU offload: 全部放 CPU，推理时按需搬
+    if torch.cuda.get_device_properties(_device).total_memory < 30 * 1024**3:
+        print(f"[API] GPU < 30GB, offloading T5 + VAE to CPU...", flush=True)
+        _pipe.text_encoder.to(device="cpu", dtype=torch.bfloat16)
+        _pipe.vae.to(device="cpu", dtype=torch.bfloat16)
+        torch.cuda.empty_cache()
+        free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+        print(f"[API] Offload done, VRAM free: {free_gb:.1f}GB", flush=True)
+
+    _LOADED_CONFIG_KIND = kind
+    print(f"[API] Pipeline ready (kind={kind}).", flush=True)
+
+
+def _unload_model():
+    """Unload model and free GPU memory."""
+    global _pipe, _config, _device
+    if _pipe is None:
+        return False
+    import gc
+    print("[API] Unloading pipeline, freeing GPU memory...")
+    _pipe = None
+    _config = None
+    gc.collect()
+    torch.cuda.empty_cache()
+    print("[API] Pipeline unloaded.")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -194,169 +227,100 @@ class TaskState:
             "status": self.status.value,
             "progress": self.progress,
             "seed": self.seed,
+            "shots_info": self.shots_info,
+            "error": self.error,
+            "video_url": _abs_url(self.video_path) if self.video_path else None,
+            "video_path": self.video_path,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
         }
-        if self.status == TaskStatus.QUEUED and queue_position is not None:
+        if queue_position is not None:
             resp["queue_position"] = queue_position
-        if self.started_at:
-            resp["elapsed_seconds"] = int(
-                (self.finished_at or time.time()) - self.started_at
-            )
-        if self.status == TaskStatus.SUCCEEDED:
-            resp["video"] = self.video_path
-            resp["video_url"] = _abs_url(self.video_path)
-            resp["shots_info"] = self.shots_info
-        if self.status == TaskStatus.FAILED:
-            resp["error"] = self.error or "unknown error"
-        if self.status == TaskStatus.CANCELLED:
-            resp["error"] = "Task cancelled by caller"
         return resp
 
 
-_TASKS: "OrderedDict[str, TaskState]" = OrderedDict()
-_TASK_LOCK = threading.Lock()
-_MAX_TASKS = 200
-
-# Only ONE generation may touch the GPU at a time (VRAM constraint).
-_GEN_LOCK = asyncio.Lock()
-
-
 def _register_task(state: TaskState) -> None:
-    with _TASK_LOCK:
-        _TASKS[state.task_id] = state
-        while len(_TASKS) > _MAX_TASKS:
-            old_id, old_state = _TASKS.popitem(last=False)
-            if old_state.status not in (TaskStatus.QUEUED, TaskStatus.RUNNING):
-                continue
-            _TASKS[old_id] = old_state
-            _TASKS.move_to_end(old_id, last=False)
-            break
+    _TASKS[state.task_id] = state
 
 
 def _get_task(task_id: str) -> Optional[TaskState]:
-    with _TASK_LOCK:
-        return _TASKS.get(task_id)
+    return _TASKS.get(task_id)
 
 
 def _list_pending_before(task_id: str) -> int:
-    """Return number of queued tasks ahead of the given task_id."""
-    with _TASK_LOCK:
-        count = 0
-        for tid, st in _TASKS.items():
-            if tid == task_id:
-                return count
-            if st.status == TaskStatus.QUEUED:
-                count += 1
-        return count
+    """Count queued tasks ahead of this one."""
+    count = 0
+    for tid, s in _TASKS.items():
+        if s.status == TaskStatus.QUEUED and s.created_at < _get_task(task_id).created_at:
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------
-# App
+# URL helper
 # ---------------------------------------------------------------------------
-app = FastAPI(
-    title="LongLive 2.0 API",
-    version="2.0.2",
-    description="T2V / I2V / Multi-shot anchor video generation API with async task model",
-)
-
-OUTPUT_DIR = Path(os.environ.get("LONGLIVE_OUTPUT", "/output"))
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-UPLOAD_DIR = Path("/tmp/longlive_uploads")
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-PUBLIC_BASE = os.environ.get("LONGLIVE_PUBLIC_BASE", "").rstrip("/")
-
-
 def _abs_url(local_path: Optional[str]) -> Optional[str]:
-    """Map an output file path to an externally reachable URL."""
     if not local_path:
         return None
-    fname = Path(local_path).name
     if PUBLIC_BASE:
-        return f"{PUBLIC_BASE}/output/{fname}"
-    return f"/output/{fname}"
+        return f"{PUBLIC_BASE}/output/{Path(local_path).name}"
+    return f"/output/{Path(local_path).name}"
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Mode detection
 # ---------------------------------------------------------------------------
 def _mode_of(shot: ShotInput) -> str:
     return "i2v" if shot.first_frame else "t2v"
 
 
 def _build_shots_info(shots: List[ShotInput]) -> List[Dict[str, Any]]:
-    return [
-        {"index": i, "mode": _mode_of(sh), "blocks": sh.blocks}
-        for i, sh in enumerate(shots)
-    ]
+    return [{"prompt": s.prompt, "mode": _mode_of(s), "blocks": s.blocks} for s in shots]
 
 
+# ---------------------------------------------------------------------------
+# Block-count resolver
+# ---------------------------------------------------------------------------
 def _resolve_shot_block_counts(shots: List[ShotInput], total_blocks: int) -> List[int]:
-    """Distribute blocks across shots, respecting explicit block counts."""
-    explicit_blocks = []
-    auto_indices = []
-
-    for i, shot in enumerate(shots):
-        if shot.blocks is not None:
-            explicit_blocks.append((i, shot.blocks))
-        else:
-            auto_indices.append(i)
-
-    used = sum(b for _, b in explicit_blocks)
-    if used > total_blocks:
-        raise ValueError(
-            f"Explicit block counts ({used}) exceed total blocks ({total_blocks})"
-        )
-
-    remaining = total_blocks - used
-    num_auto = len(auto_indices)
-    if num_auto == 0 and used != total_blocks:
-        raise ValueError(
-            f"Explicit block counts ({used}) don't equal total blocks ({total_blocks})"
-        )
-
-    result = [0] * len(shots)
-    for i, b in explicit_blocks:
-        result[i] = b
-
-    if num_auto > 0:
-        per_shot = remaining // num_auto
-        remainder = remaining - per_shot * num_auto
-        for i in auto_indices:
-            result[i] = per_shot
-        result[auto_indices[-1]] += remainder
-
+    if len(shots) == 1:
+        if shots[0].blocks is not None:
+            return [shots[0].blocks]
+        return [total_blocks]
+    explicit = [s.blocks for s in shots if s.blocks is not None]
+    if explicit:
+        if any(s.blocks is None for s in shots):
+            raise ValueError(
+                "When setting blocks, all shots must have explicit blocks in multi-shot mode"
+            )
+        return [s.blocks for s in shots]
+    equal = total_blocks // len(shots)
+    remainder = total_blocks % len(shots)
+    result = [equal + (1 if i < remainder else 0) for i in range(len(shots))]
     return result
 
 
+# ---------------------------------------------------------------------------
+# Image encoding
+# ---------------------------------------------------------------------------
 def _encode_frame(image_path: str) -> torch.Tensor:
-    """Load and encode an image to VAE latent. Returns (1, 1, C, h, w)."""
-    from utils.inference_utils import (
-        load_and_preprocess_image,
-        image_to_tensor,
-        encode_image_to_latent,
-    )
-
-    config = _config
-    latent_shape = list(config.image_or_video_shape[2:])  # [C, h, w]
-    pixel_h = latent_shape[1] * 8
-    pixel_w = latent_shape[2] * 8
-
-    img = load_and_preprocess_image(image_path, target_width=pixel_w, target_height=pixel_h)
+    """Load image, preprocess, encode to VAE latent."""
+    from utils.inference_utils import load_and_preprocess_image, image_to_tensor, encode_image_to_latent
+    img = load_and_preprocess_image(image_path)
     tensor = image_to_tensor(img, _device)
-    latent = encode_image_to_latent(_pipe.vae, tensor)  # (1, 1, C, h, w)
+    latent = encode_image_to_latent(_pipe.vae, tensor)
     return latent
 
 
 def _resolve_img(value: str, image_map: Optional[Dict[str, str]]) -> str:
-    """Resolve an upload filename or absolute path to a real path on disk."""
+    """Resolve an image path: check upload map first, then treat as filesystem path."""
     if image_map and value in image_map:
         return image_map[value]
     return value
 
 
 # ---------------------------------------------------------------------------
-# Core generation logic (runs in thread pool)
+# Core generation
 # ---------------------------------------------------------------------------
 def _run_generate(
     shots: List[ShotInput],
@@ -364,150 +328,142 @@ def _run_generate(
     seed: int,
     fps: int,
     image_map: Optional[Dict[str, str]] = None,
-    progress_cb: Optional[Callable[[int], None]] = None,
 ) -> str:
-    """Unified generation — call via asyncio.to_thread."""
-    _ensure_loaded()
-    from utils.config import section_get
-    from utils.inference_utils import save_video
-    from utils.misc import set_seed
+    """Synchronous generation — called from asyncio.to_thread.
 
-    if progress_cb:
-        progress_cb(0)
+    Follows the official LongLive 2.0 inference contract documented in README.md:
+        noise, prompts = prepare_single_prompt_inputs(config, prompt, device)
+        video = pipe.inference(noise=noise, text_prompts=prompts)
+        save_video(video[0], path, fps=24)
 
-    config = _config
-    config.num_output_frames = num_frames
-    frames_per_block = int(getattr(config, "num_frame_per_block", 1))
+    Multi-shot extensions (shot_anchors + per-shot prompt list) are wired into
+    pipe.inference()'s `shot_anchors` / `text_prompts` kwargs.
+    """
+    from utils.inference_utils import prepare_single_prompt_inputs, save_video
 
-    if num_frames % frames_per_block != 0:
-        raise ValueError(
-            f"num_frames={num_frames} must be divisible by "
-            f"num_frame_per_block={frames_per_block}"
-        )
+    # 根据是否提供首帧选 yaml：T2V 用 inference.yaml（无 indep_ff），I2V 用 inference_i2v.yaml
+    has_first_frame = bool(shots and shots[0].first_frame)
+    kind = "i2v" if has_first_frame else "t2v"
+    _ensure_loaded(kind)
 
-    num_blocks = num_frames // frames_per_block
+    # ── 合法化 num_frames ──────────────────────────────────────────
+    # prepare_single_prompt_inputs 要求 num_frames % num_frame_per_block == 0
+    fpb = int(getattr(_config, "num_frame_per_block", 8))
+    legalised = max(fpb, (num_frames // fpb) * fpb)
+    if legalised != num_frames:
+        print(f"[API] num_frames {num_frames} → {legalised} (kind={kind}, fpb={fpb})", flush=True)
+    num_frames = legalised
+    # 写回 config 让 prepare_single_prompt_inputs / pipe.inference 都看到一致值
+    try:
+        _config.num_output_frames = num_frames
+    except Exception:
+        pass
 
-    # Enable independent_first_frame if any shot has a first_frame
-    has_first_frame = any(s.first_frame for s in shots)
-    if has_first_frame:
-        if not section_get(config, "inference", "independent_first_frame", False):
-            config.inference.independent_first_frame = True
+    image_map = image_map or {}
+    block_counts = _resolve_shot_block_counts(shots, num_frames)
+    shot_anchors = []
+    current_chunk = 0
+    for i, (shot, blocks) in enumerate(zip(shots, block_counts)):
+        if i > 0 and shot.first_frame:  # shot 0 用 initial_latent 路径，多镜头用 anchor
+            path = _resolve_img(shot.first_frame, image_map)
+            latent = _encode_frame(path)
+            shot_anchors.append({"chunk_index": current_chunk, "latent": latent})
+        current_chunk += blocks
 
-    set_seed(seed)
-    seed_g = torch.Generator(device=_device)
-    seed_g.manual_seed(seed)
+    # 第一镜头 prompt 当 base prompt 给 prepare_single_prompt_inputs，按 num_blocks 平铺
+    base_prompt = shots[0].prompt if shots else ""
+    # 用确定性 generator 保证 seed 可复现（prepare_single_prompt_inputs 不接 seed kwarg，
+    # 须通过 torch.Generator 传入）
+    generator = torch.Generator(device=_device).manual_seed(int(seed) & 0x7FFFFFFF)
+    noise, prompts = prepare_single_prompt_inputs(
+        _config, base_prompt, _device, dtype=torch.bfloat16, generator=generator
+    )
 
-    latent_shape = list(config.image_or_video_shape[2:])
+    # 多镜头：用每个 shot 的 prompt 覆盖对应 block 段（prompts 是 List[List[str]]）
+    if len(shots) > 1:
+        # prompts[batch=0] 是按 block 平铺的 base_prompt list；按 block_counts 切片覆盖
+        seq = prompts[0]
+        idx = 0
+        for shot, blocks in zip(shots, block_counts):
+            for b in range(blocks):
+                if idx >= len(seq):
+                    break
+                seq[idx] = shot.prompt
+                idx += 1
+        prompts = [seq]
 
-    # Resolve block counts per shot
-    block_counts = _resolve_shot_block_counts(shots, num_blocks)
-
-    # Whether the chunk schedule has a leading t=0 frame chunk inserted by
-    # the pipeline's independent_first_frame mode. The pipeline schedules
-    # `[1] + [frames_per_block] * num_blocks` in that case (see
-    # _inference_inner: `if self.independent_first_frame and initial_latent
-    # is None: all_num_frames = [1] + all_num_frames`). When initial_latent
-    # IS provided, the t=0 frame is consumed by the warm-up loop instead
-    # and does NOT add an extra chunk to the main schedule.
-    use_independent_first = bool(getattr(_config.inference, "independent_first_frame", False))
+    # 首帧锚定（shot 0 走标准 I2V 路径）
     initial_latent = None
-    if shots[0].first_frame:
-        img_path = _resolve_img(shots[0].first_frame, image_map)
-        print(f"[API] Encoding first frame for shot 0: {img_path}")
-        initial_latent = _encode_frame(img_path)
+    if shots and shots[0].first_frame:
+        first_frame_path = _resolve_img(shots[0].first_frame, image_map)
+        initial_latent = _encode_frame(first_frame_path)
 
-    # Compute the chunk index where each shot starts.
-    # Chunk indexing (when initial_latent is provided, no leading [1] chunk):
-    #   shot 0 occupies chunks [0, block_counts[0])
-    #   shot i starts at sum(block_counts[:i])
-    # When initial_latent is None and independent_first_frame is true, the
-    # pipeline prepends one leading single-frame chunk → shot starts shift +1.
-    chunk_offset = 0
-    if initial_latent is None and use_independent_first:
-        chunk_offset = 1
+    # 推理：pipe.inference 是命名方法，非 __call__
+    with torch.no_grad():
+        print(f"[API] Starting inference (num_frames={len(noise[0])}, blocks={len(noise[0])//8})...", flush=True)
 
-    shot_chunk_starts: List[int] = []
-    running = chunk_offset
-    for bc in block_counts:
-        shot_chunk_starts.append(running)
-        running += bc
+        need_offload = next(_pipe.text_encoder.parameters()).device.type != 'cuda'
 
-    # Build per-block prompt list.
-    # Prepend SCENE_CUT_PREFIX to the FIRST block of every shot[i>0] so that
-    # `_is_shot_boundary` / `_is_scene_cut` activate inside the pipeline.
-    all_prompts: List[str] = []
-    shots_info: List[Dict[str, Any]] = []
-    for i, (shot, bc) in enumerate(zip(shots, block_counts)):
-        for blk in range(bc):
-            if i > 0 and blk == 0:
-                all_prompts.append(SCENE_CUT_PREFIX + shot.prompt)
-            else:
-                all_prompts.append(shot.prompt)
-        shots_info.append({
-            "index": i,
-            "mode": _mode_of(shot),
-            "prompt": shot.prompt[:80],
-            "blocks": bc,
-        })
+        if need_offload:
+            # Step 1: 全部在 CPU，搬 T5 到 GPU 编码
+            print("[API] Moving T5 to GPU for encoding...", flush=True)
+            _pipe.text_encoder.to(device='cuda')
+            torch.cuda.empty_cache()
 
-    # Build shot_anchors for shots[i>0].first_frame so each shot starts
-    # from its own visual reference. Shot 0's first_frame is already wired
-    # through `initial_latent` above and must NOT also appear in anchors.
-    shot_anchors: List[Dict[str, Any]] = []
-    for i in range(1, len(shots)):
-        shot = shots[i]
-        if not shot.first_frame:
-            continue
-        img_path = _resolve_img(shot.first_frame, image_map)
-        try:
-            anchor = _encode_frame(img_path)
-        except Exception as e:
-            raise ValueError(f"shot[{i}].first_frame encode failed: {e}")
-        shot_anchors.append({
-            "chunk_index": shot_chunk_starts[i],
-            "latent": anchor,
-        })
-        print(f"[API] Shot anchor prepared: shot={i} chunk_index={shot_chunk_starts[i]} src={img_path}")
+            # Monkey-patch: T5 encode 完后立即放回 CPU，DiT 搬到 GPU
+            _orig_forward = _pipe.text_encoder.forward
+            _offload_done = [False]
+            def _patched_forward(*args, **kwargs):
+                result = _orig_forward(*args, **kwargs)
+                if not _offload_done[0]:
+                    print("[API] T5 done, offload T5→CPU, DiT→GPU...", flush=True)
+                    _pipe.text_encoder.to(device='cpu')
+                    _pipe.generator.to(device='cuda', dtype=torch.bfloat16)
+                    _pipe.generator.model.eval().requires_grad_(False)
+                    torch.cuda.empty_cache()
+                    free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+                    print(f"[API] Ready for DiT, VRAM free: {free_gb:.1f}GB", flush=True)
+                    _offload_done[0] = True
+                return result
+            _pipe.text_encoder.forward = _patched_forward
 
-    # Generate noise
-    noise = torch.randn(
-        [1, num_frames, *latent_shape],
-        device=_device,
-        dtype=torch.bfloat16,
-        generator=seed_g,
-    )
+        video_tensor = _pipe.inference(
+            noise=noise,
+            text_prompts=prompts,
+            initial_latent=initial_latent,
+            return_latents=False,
+            shot_anchors=shot_anchors if shot_anchors else None,
+        )
+        print(f"[API] Inference done, video_tensor shape={video_tensor.shape}", flush=True)
 
-    if progress_cb:
-        progress_cb(50)
+        if need_offload:
+            _pipe.text_encoder.forward = _orig_forward
 
-    # Run inference
-    print(f"[API] Generating video: {len(shots)} shots, {num_blocks} blocks, "
-          f"mode(s)={[s['mode'] for s in shots_info]}, "
-          f"anchors={len(shot_anchors)}")
-    t0 = time.time()
-    video = _pipe.inference(
-        noise=noise,
-        text_prompts=all_prompts,
-        initial_latent=initial_latent,
-        start_frame_index=0,
-        shot_anchors=shot_anchors if shot_anchors else None,
-    )
-    elapsed = time.time() - t0
-    print(f"[API] Generation completed in {elapsed:.1f}s")
+        # VAE decode
+        vae_on_gpu = next(_pipe.vae.parameters()).device.type == 'cuda'
+        if not vae_on_gpu:
+            print("[API] Moving VAE to GPU for decoding...", flush=True)
+            _pipe.generator.to(device='cpu')
+            torch.cuda.empty_cache()
+            _pipe.vae.to(device='cuda')
+            torch.cuda.empty_cache()
 
-    # Save
-    out_name = f"gen_seed{seed}_{int(time.time())}.mp4"
-    out_path = OUTPUT_DIR / out_name
-    save_video(video[0], str(out_path), fps=fps)
-    print(f"[API] Video saved: {out_path}")
+        filename = f"longlive_{int(time.time())}_{seed}.mp4"
+        out_path = OUTPUT_DIR / filename
+        print(f"[API] Saving video to {out_path}...", flush=True)
+        save_video(video_tensor[0], out_path, fps=fps)
+        print(f"[API] Video saved: {out_path}", flush=True)
 
-    if progress_cb:
-        progress_cb(100)
+        if not vae_on_gpu:
+            _pipe.vae.to(device='cpu')
+            torch.cuda.empty_cache()
+            print("[API] VAE offloaded to CPU", flush=True)
+
     return str(out_path)
 
 
 # ---------------------------------------------------------------------------
-# Async runner
+# Background task runner
 # ---------------------------------------------------------------------------
 async def _run_task_in_background(
     state: TaskState,
@@ -515,66 +471,61 @@ async def _run_task_in_background(
     num_frames: int,
     seed: int,
     fps: int,
-    image_map: Optional[Dict[str, str]],
-) -> None:
+    image_map: Optional[Dict[str, str]] = None,
+):
     """Background coroutine: wait for GPU lock then run generation."""
-    async with _GEN_LOCK:
-        if state.cancel_flag:
-            state.status = TaskStatus.CANCELLED
-            state.finished_at = time.time()
-            return
-
-        state.status = TaskStatus.RUNNING
-        state.started_at = time.time()
-
-        def _cb(pct: int) -> None:
+    state.status = TaskStatus.RUNNING
+    state.started_at = time.time()
+    state.seed = seed
+    try:
+        def _progress_cb(pct: int) -> None:
             state.progress = pct
 
-        try:
-            path = await asyncio.to_thread(
-                _run_generate,
-                shots,
-                num_frames,
-                seed,
-                fps,
-                image_map,
-                _cb,
-            )
-            state.video_path = path
-            state.shots_info = _build_shots_info(shots)
-            state.progress = 100
-            state.status = TaskStatus.SUCCEEDED
-        except Exception as e:
-            state.error = str(e)
-            state.status = TaskStatus.FAILED
-        finally:
-            state.finished_at = time.time()
-            for p in state._tmp_files:
-                try:
-                    p.unlink(missing_ok=True)
-                except Exception:
-                    pass
+        path = await asyncio.to_thread(
+            _run_generate, shots, num_frames, seed, fps, image_map
+        )
+        state.video_path = path
+        state.status = TaskStatus.SUCCEEDED
+        state.progress = 100
+    except asyncio.CancelledError:
+        state.status = TaskStatus.CANCELLED
+    except BaseException as e:
+        import traceback as _tb
+        tb_str = _tb.format_exc()
+        # 同时打到 stderr 方便 docker logs，并存进 state.error
+        print(f"[API] Task {state.task_id} failed:\n{tb_str}", flush=True)
+        state.status = TaskStatus.FAILED
+        state.error = f"{type(e).__name__}: {e}\n{tb_str}"
+    finally:
+        state.finished_at = time.time()
+        for p in state._tmp_files:
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def _spawn_task(
-    shots: List[ShotInput],
-    num_frames: int,
-    seed: int,
-    fps: int,
-    image_map: Optional[Dict[str, str]],
-    tmp_files: Optional[List[Path]] = None,
+    shots, num_frames, seed, fps, image_map=None, tmp_files=None
 ) -> TaskState:
-    task_id = uuid.uuid4().hex
-    state = TaskState(task_id)
-    state.seed = seed
-    if tmp_files:
-        state._tmp_files = list(tmp_files)
+    state = TaskState(task_id=uuid.uuid4().hex[:12])
+    state._tmp_files = tmp_files or []
     _register_task(state)
-    asyncio.create_task(
-        _run_task_in_background(state, shots, num_frames, seed, fps, image_map)
-    )
+    asyncio.create_task(_run_task_in_background(state, shots, num_frames, seed, fps, image_map))
     return state
 
+
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
+app = FastAPI(title="LongLive 2.0")
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    import traceback as _tb
+    print(f"[API] Unhandled exception:\n{_tb.format_exc()}", flush=True)
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=500, detail=str(exc))
 
 # ---------------------------------------------------------------------------
 # Endpoints
@@ -594,7 +545,7 @@ async def status():
         info["gpu"] = torch.cuda.get_device_name(0)
         info["vram_free_gb"] = round(torch.cuda.mem_get_info()[0] / 1024 ** 3, 1)
         info["vram_total_gb"] = round(torch.cuda.mem_get_info()[1] / 1024 ** 3, 1)
-    with _TASK_LOCK:
+    async with _TASK_LOCK:
         info["tasks_total"] = len(_TASKS)
         info["tasks_running"] = sum(1 for s in _TASKS.values() if s.status == TaskStatus.RUNNING)
         info["tasks_queued"] = sum(1 for s in _TASKS.values() if s.status == TaskStatus.QUEUED)
@@ -628,6 +579,8 @@ async def generate(
             "shots_info": _build_shots_info(req.shots),
         }
     except Exception as e:
+        import traceback as _tb
+        print(f"[API] _run_generate FAILED:\n{_tb.format_exc()}", flush=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -727,7 +680,7 @@ async def cancel_task(task_id: str):
 @app.get("/api/tasks")
 async def list_tasks(limit: int = Query(50, ge=1, le=200)):
     """List recent tasks (newest first)."""
-    with _TASK_LOCK:
+    async with _TASK_LOCK:
         items = list(_TASKS.values())
     items = list(reversed(items))[:limit]
     return {"total": len(items), "tasks": [s.to_dict() for s in items]}
@@ -755,6 +708,448 @@ async def download_video(filename: str):
     if not path.exists():
         raise HTTPException(status_code=404, detail="Video not found")
     return FileResponse(str(path), media_type="video/mp4", filename=filename)
+
+
+# ---------------------------------------------------------------------------
+# Model management
+# ---------------------------------------------------------------------------
+
+@app.post("/api/unload")
+async def unload_model():
+    """Unload model to free GPU memory for other tasks."""
+    async with _TASK_LOCK:
+        running = any(s.status == TaskStatus.RUNNING for s in _TASKS.values())
+    if running:
+        raise HTTPException(status_code=409, detail="Cannot unload while tasks are running")
+    freed = _unload_model()
+    if not freed:
+        return {"detail": "Model not loaded"}
+    return {"detail": "Model unloaded, GPU memory freed"}
+
+
+# ---------------------------------------------------------------------------
+# Web UI
+# ---------------------------------------------------------------------------
+
+@app.get("/", response_class=HTMLResponse)
+async def web_ui():
+    return HTML_PAGE
+
+
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LongLive 2.0</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0a0a0b;--card:#141416;--border:#2a2a2e;--text:#e4e4e7;--dim:#71717a;--accent:#a78bfa;--accent2:#818cf8;--green:#34d399;--red:#f87171;--yellow:#fbbf24;--blue:#60a5fa;--radius:10px}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;line-height:1.6}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+
+.header{border-bottom:1px solid var(--border);padding:16px 24px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
+.header h1{font-size:20px;font-weight:600;background:linear-gradient(135deg,var(--accent),var(--blue));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.header-actions{display:flex;gap:8px;align-items:center}
+
+.container{max-width:1200px;margin:0 auto;padding:24px}
+
+/* Status bar */
+.status-bar{display:flex;gap:12px;margin-bottom:24px;flex-wrap:wrap}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:12px 16px;flex:1;min-width:140px}
+.stat-label{font-size:12px;color:var(--dim);margin-bottom:2px}
+.stat-value{font-size:18px;font-weight:600}
+.stat-value.green{color:var(--green)}
+.stat-value.red{color:var(--red)}
+.stat-value.yellow{color:var(--yellow)}
+
+/* Cards */
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:20px}
+.card h2{font-size:16px;font-weight:600;margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.card h2 .badge{font-size:11px;padding:2px 8px;border-radius:99px;font-weight:500}
+.badge-green{background:rgba(52,211,153,.15);color:var(--green)}
+.badge-red{background:rgba(248,113,113,.15);color:var(--red)}
+.badge-blue{background:rgba(96,165,250,.15);color:var(--blue)}
+.badge-yellow{background:rgba(251,191,36,.15);color:var(--yellow)}
+
+/* Form */
+.form-row{margin-bottom:14px}
+.form-row label{display:block;font-size:13px;color:var(--dim);margin-bottom:4px}
+textarea,input[type="number"],input[type="text"],select{
+  width:100%;background:#1c1c1f;border:1px solid var(--border);border-radius:8px;
+  padding:10px 12px;color:var(--text);font-size:14px;font-family:inherit;outline:none;transition:border .2s
+}
+textarea:focus,input:focus,select:focus{border-color:var(--accent)}
+textarea{resize:vertical;min-height:60px}
+.shots-list{display:flex;flex-direction:column;gap:10px}
+.shot-item{background:#1c1c1f;border:1px solid var(--border);border-radius:8px;padding:12px;position:relative}
+.shot-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;font-size:13px;font-weight:600;color:var(--dim)}
+.shot-header .mode-tag{font-size:11px;padding:1px 6px;border-radius:4px;background:rgba(167,139,250,.15);color:var(--accent)}
+.btn-remove{background:none;border:none;color:var(--red);cursor:pointer;font-size:18px;padding:0 4px;opacity:.7;transition:opacity .2s}
+.btn-remove:hover{opacity:1}
+.form-inline{display:flex;gap:8px;align-items:end}
+.form-inline .form-row{flex:1;margin-bottom:0}
+.file-label{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;background:#1c1c1f;border:1px dashed var(--border);border-radius:6px;cursor:pointer;font-size:13px;color:var(--dim);transition:border .2s}
+.file-label:hover{border-color:var(--accent);color:var(--text)}
+.file-label input{display:none}
+
+/* Buttons */
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:8px;font-size:14px;font-weight:500;cursor:pointer;border:none;transition:all .2s;font-family:inherit}
+.btn-primary{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff}
+.btn-primary:hover{opacity:.9;transform:translateY(-1px)}
+.btn-primary:disabled{opacity:.5;cursor:not-allowed;transform:none}
+.btn-sm{padding:5px 12px;font-size:13px}
+.btn-ghost{background:transparent;border:1px solid var(--border);color:var(--text)}
+.btn-ghost:hover{border-color:var(--accent);color:var(--accent)}
+.btn-danger{background:rgba(248,113,113,.15);color:var(--red);border:1px solid rgba(248,113,113,.3)}
+.btn-danger:hover{background:rgba(248,113,113,.25)}
+
+/* Shot toggle */
+.shot-toggle{display:flex;gap:6px;margin-bottom:14px}
+.shot-toggle button{padding:6px 12px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--dim);cursor:pointer;font-size:13px;font-family:inherit}
+.shot-toggle button.active{background:rgba(167,139,250,.15);border-color:var(--accent);color:var(--accent)}
+.shot-toggle button:hover{border-color:var(--accent)}
+
+/* Params row */
+.params-row{display:flex;gap:12px;flex-wrap:wrap}
+.params-row .form-row{flex:1;min-width:100px}
+.params-row input{width:100%}
+
+/* Tasks */
+.task-item{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--border)}
+.task-item:last-child{border-bottom:none}
+.task-status{font-size:12px;padding:2px 8px;border-radius:4px;font-weight:500;white-space:nowrap}
+.status-queued{background:rgba(251,191,36,.15);color:var(--yellow)}
+.status-running{background:rgba(96,165,250,.15);color:var(--blue)}
+.status-succeeded{background:rgba(52,211,153,.15);color:var(--green)}
+.status-failed{background:rgba(248,113,113,.15);color:var(--red)}
+.status-cancelled{background:rgba(113,113,122,.15);color:var(--dim)}
+.task-info{flex:1;font-size:13px;overflow:hidden}
+.task-info .prompt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:400px;color:var(--dim)}
+.progress-bar{width:120px;height:4px;background:#2a2a2e;border-radius:2px;overflow:hidden;flex-shrink:0}
+.progress-bar .fill{height:100%;background:var(--accent);border-radius:2px;transition:width .3s}
+.task-actions{flex-shrink:0}
+
+/* Videos */
+.video-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
+.video-card{background:#1c1c1f;border:1px solid var(--border);border-radius:8px;overflow:hidden;transition:border .2s}
+.video-card:hover{border-color:var(--accent)}
+.video-card video{width:100%;display:block;max-height:200px;object-fit:contain;background:#000}
+.video-meta{padding:10px 12px;font-size:12px;color:var(--dim);display:flex;justify-content:space-between;align-items:center}
+.video-meta .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:180px}
+
+/* VRAM bar */
+.vram-bar{width:100%;height:8px;background:#1c1c1f;border-radius:4px;overflow:hidden;margin-top:6px}
+.vram-bar .used{height:100%;border-radius:4px;transition:width .5s,background .5s}
+
+/* Toast */
+.toast{position:fixed;top:20px;right:20px;padding:12px 20px;border-radius:8px;font-size:14px;z-index:999;animation:slideIn .3s;pointer-events:none}
+@keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
+
+.empty{text-align:center;padding:30px;color:var(--dim);font-size:14px}
+
+/* Responsive */
+@media(max-width:640px){
+  .container{padding:16px}
+  .params-row{flex-direction:column}
+  .status-bar{flex-direction:column}
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>🐉 LongLive 2.0</h1>
+  <div class="header-actions">
+    <button class="btn btn-sm btn-ghost" onclick="loadStatus()">🔄 刷新</button>
+    <button class="btn btn-sm btn-danger" id="btn-unload" onclick="unloadModel()" style="display:none">⏏ 卸载模型</button>
+  </div>
+</div>
+
+<div class="container">
+  <!-- Status -->
+  <div class="status-bar" id="status-bar">
+    <div class="stat"><div class="stat-label">GPU</div><div class="stat-value" id="s-gpu">-</div></div>
+    <div class="stat"><div class="stat-label">模型</div><div class="stat-value" id="s-model">-</div></div>
+    <div class="stat"><div class="stat-label">显存</div><div class="stat-value" id="s-vram">-</div>
+      <div class="vram-bar"><div class="used" id="s-vram-bar"></div></div>
+    </div>
+    <div class="stat"><div class="stat-label">任务</div><div class="stat-value" id="s-tasks">-</div></div>
+  </div>
+
+  <!-- Generate -->
+  <div class="card">
+    <h2>🎬 生成视频</h2>
+    <div class="shot-toggle">
+      <button class="active" onclick="setShotMode(1)">单镜头</button>
+      <button onclick="setShotMode(2)">双镜头</button>
+      <button onclick="setShotMode(3)">三镜头</button>
+      <button onclick="setShotMode(0)">自定义</button>
+    </div>
+    <div class="shots-list" id="shots-list"></div>
+    <div class="params-row" style="margin-top:14px">
+      <div class="form-row"><label>帧数</label><input type="number" id="num_frames" value="128" min="8" step="8"></div>
+      <div class="form-row"><label>Seed (0=随机)</label><input type="number" id="seed" value="0"></div>
+      <div class="form-row"><label>FPS</label><input type="number" id="fps" value="24" min="1" max="60"></div>
+    </div>
+    <div style="margin-top:16px;display:flex;gap:8px">
+      <button class="btn btn-primary" id="btn-gen" onclick="generate()">🚀 开始生成</button>
+      <button class="btn btn-ghost" onclick="loadTasks()">📋 任务列表</button>
+      <button class="btn btn-ghost" onclick="loadVideos()">📁 视频列表</button>
+    </div>
+  </div>
+
+  <!-- Tasks -->
+  <div class="card" id="tasks-card" style="display:none">
+    <h2>📋 任务队列</h2>
+    <div id="tasks-list"></div>
+  </div>
+
+  <!-- Videos -->
+  <div class="card" id="videos-card" style="display:none">
+    <h2>📁 已生成视频</h2>
+    <div class="video-grid" id="video-grid"></div>
+  </div>
+</div>
+
+<script>
+let shots = [{prompt:'',first_frame:null,blocks:null}];
+let shotCount = 1;
+let pollingTaskId = null;
+let pollingTimer = null;
+
+function $(id){return document.getElementById(id)}
+
+function toast(msg, type='info'){
+  const t = document.createElement('div');
+  t.className = 'toast';
+  t.style.background = type==='error'?'rgba(248,113,113,.9)':type==='success'?'rgba(52,211,153,.9)':'rgba(167,139,250,.9)';
+  t.style.color = '#fff';
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(()=>t.remove(), 3000);
+}
+
+// --- Status ---
+async function loadStatus(){
+  try{
+    const r = await fetch('/api/status');
+    const d = await r.json();
+    $('s-gpu').textContent = d.gpu || 'N/A';
+    const ml = d.model_loaded;
+    $('s-model').textContent = ml ? '已加载' : '未加载';
+    $('s-model').className = 'stat-value ' + (ml?'green':'red');
+    $('btn-unload').style.display = ml ? '' : 'none';
+    if(d.vram_free_gb != null){
+      const used = d.vram_total_gb - d.vram_free_gb;
+      const pct = Math.round(used/d.vram_total_gb*100);
+      $('s-vram').textContent = used.toFixed(1)+'/'+d.vram_total_gb+' GB';
+      const bar = $('s-vram-bar');
+      bar.style.width = pct+'%';
+      bar.style.background = pct>90?'var(--red)':pct>70?'var(--yellow)':'var(--green)';
+    }
+    const parts = [];
+    if(d.tasks_running) parts.push(d.tasks_running+' 运行');
+    if(d.tasks_queued) parts.push(d.tasks_queued+' 排队');
+    $('s-tasks').textContent = parts.length?parts.join(' / '):'空闲';
+  }catch(e){console.error(e)}
+}
+
+async function unloadModel(){
+  if(!confirm('确定卸载模型？这会释放 GPU 显存。')) return;
+  try{
+    const r = await fetch('/api/unload',{method:'POST'});
+    const d = await r.json();
+    toast(d.detail, 'success');
+    loadStatus();
+  }catch(e){toast(e.message,'error')}
+}
+
+// --- Shots ---
+function setShotMode(n){
+  shotCount = n || 1;
+  if(n===0){
+    shots.push({prompt:'',first_frame:null,blocks:null});
+    shotCount = shots.length;
+  }
+  shots = shots.slice(0, shotCount);
+  while(shots.length < shotCount) shots.push({prompt:'',first_frame:null,blocks:null});
+  renderShots();
+}
+
+function removeShot(i){
+  shots.splice(i,1);
+  shotCount = shots.length;
+  renderShots();
+}
+
+function renderShots(){
+  const c = $('shots-list');
+  c.innerHTML = shots.map((s,i)=>{
+    const mode = s.first_frame ? 'I2V' : 'T2V';
+    return `<div class="shot-item">
+      <div class="shot-header">
+        <span>镜头 ${i+1} <span class="mode-tag" id="mode-${i}">${mode}</span></span>
+        ${shots.length>1?`<button class="btn-remove" onclick="removeShot(${i})">✕</button>`:''}
+      </div>
+      <div class="form-row"><label>提示词</label><textarea id="prompt-${i}" placeholder="描述画面内容..." oninput="shots[${i}].prompt=this.value">${s.prompt}</textarea></div>
+      <div class="form-inline">
+        <div class="form-row"><label>首帧图片</label>
+          <label class="file-label" id="flabel-${i}">📷 选择图片
+            <input type="file" accept="image/*" onchange="handleFile(${i},this)">
+          </label>
+          <span id="fname-${i}" style="font-size:12px;color:var(--dim);margin-left:6px">${s.first_frame?'✓ '+s.first_frame:''}</span>
+        </div>
+        ${shots.length>1?`<div class="form-row"><label>块数</label><input type="number" id="blocks-${i}" value="${s.blocks||''}" min="1" placeholder="自动" onchange="shots[${i}].blocks=this.value?parseInt(this.value):null"></div>`:''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function handleFile(i, input){
+  const file = input.files[0];
+  if(!file) return;
+  shots[i].first_frame = file.name;
+  shots[i]._file = file;
+  $('fname-'+i).textContent = '✓ '+file.name;
+  $('mode-'+i).textContent = 'I2V';
+}
+
+// --- Generate ---
+async function generate(){
+  const btn = $('btn-gen');
+  btn.disabled = true;
+  btn.textContent = '⏳ 提交中...';
+
+  const numFrames = parseInt($('num_frames').value)||128;
+  const seed = parseInt($('seed').value)||0;
+  const fps = parseInt($('fps').value)||24;
+
+  // Check if any shot has uploaded files → use upload-v2
+  const hasFiles = shots.some(s=>s._file);
+  if(hasFiles){
+    const fd = new FormData();
+    const shotsData = shots.map(s=>({prompt:s.prompt, first_frame:s.first_frame||null, blocks:s.blocks}));
+    fd.append('shots_json', JSON.stringify(shotsData));
+    fd.append('num_frames', numFrames);
+    fd.append('seed', seed);
+    fd.append('fps', fps);
+
+    shots.forEach((s,i)=>{
+      if(s._file){
+        fd.append('img_'+s.first_frame, s._file);
+      }
+    });
+
+    try{
+      const r = await fetch('/api/generate/upload-v2?async=true',{
+        method:'POST', body:fd
+      });
+      if(!r.ok){const e=await r.json();throw new Error(e.detail||'Error');}
+      const d = await r.json();
+      toast('任务已提交: '+d.task_id,'success');
+      startPolling(d.task_id);
+    }catch(e){toast(e.message,'error')}
+  } else {
+    // JSON generate
+    const body = {
+      shots: shots.map(s=>({prompt:s.prompt, first_frame:s.first_frame||null, blocks:s.blocks})),
+      num_frames: numFrames, seed, fps
+    };
+    try{
+      const r = await fetch('/api/generate?async=true',{
+        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
+      });
+      if(!r.ok){const e=await r.json();throw new Error(e.detail||'Error');}
+      const d = await r.json();
+      toast('任务已提交: '+d.task_id,'success');
+      startPolling(d.task_id);
+    }catch(e){toast(e.message,'error')}
+  }
+  btn.disabled = false;
+  btn.textContent = '🚀 开始生成';
+}
+
+function startPolling(taskId){
+  pollingTaskId = taskId;
+  $('tasks-card').style.display = '';
+  if(pollingTimer) clearInterval(pollingTimer);
+  pollingTimer = setInterval(()=>{pollTask(taskId);loadStatus();}, 3000);
+  pollTask(taskId);
+  loadTasks();
+}
+
+async function pollTask(taskId){
+  try{
+    const r = await fetch('/api/task/'+taskId);
+    if(r.status===404){clearInterval(pollingTimer);return}
+    const d = await r.json();
+    loadTasks();
+    if(d.status==='succeeded'){
+      clearInterval(pollingTimer);
+      toast('✅ 生成完成！','success');
+      loadVideos();
+    }else if(d.status==='failed'){
+      clearInterval(pollingTimer);
+      toast('❌ 失败: '+(d.error||'未知'),'error');
+    }
+  }catch(e){console.error(e)}
+}
+
+// --- Tasks ---
+async function loadTasks(){
+  try{
+    const r = await fetch('/api/tasks?limit=20');
+    const d = await r.json();
+    $('tasks-card').style.display = '';
+    if(!d.tasks.length){
+      $('tasks-list').innerHTML = '<div class="empty">暂无任务</div>';
+      return;
+    }
+    $('tasks-list').innerHTML = d.tasks.map(t=>{
+      const pct = t.progress||0;
+      return `<div class="task-item">
+        <span class="task-status status-${t.status}">${t.status}</span>
+        <div class="task-info">
+          <div style="font-weight:500">${t.shots_info?(()=>{const p=t.shots_info.map(s=>s.prompt).join(' → ');return p.length>60?p.slice(0,60)+'…':p})():''}</div>
+          <div class="prompt">seed: ${t.seed} | ${new Date(t.created_at*1000).toLocaleTimeString()}</div>
+        </div>
+        ${t.status==='running'?`<div class="progress-bar"><div class="fill" style="width:${pct}%"></div></div>`:''}
+        ${t.video_url?`<div class="task-actions"><a href="${t.video_url}" class="btn btn-sm btn-ghost" target="_blank">▶</a></div>`:''}
+      </div>`;
+    }).join('');
+  }catch(e){console.error(e)}
+}
+
+// --- Videos ---
+async function loadVideos(){
+  try{
+    const r = await fetch('/api/videos');
+    const d = await r.json();
+    $('videos-card').style.display = '';
+    if(!d.videos.length){
+      $('video-grid').innerHTML = '<div class="empty">暂无视频</div>';
+      return;
+    }
+    $('video-grid').innerHTML = d.videos.slice().reverse().map(v=>`
+      <div class="video-card">
+        <video controls preload="metadata" src="/output/${v.name}"></video>
+        <div class="video-meta">
+          <span class="name" title="${v.name}">${v.name}</span>
+          <span>${v.size_mb} MB</span>
+        </div>
+      </div>`).join('');
+  }catch(e){console.error(e)}
+}
+
+// --- Init ---
+renderShots();
+loadStatus();
+</script>
+</body>
+</html>
+"""
 
 
 # ---------------------------------------------------------------------------

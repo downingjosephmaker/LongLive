@@ -1,0 +1,9 @@
+models
+output
+prompts
+__pycache__
+*.pyc
+.git
+.venv
+wandb
+*.egg-info
