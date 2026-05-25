@@ -1,78 +1,115 @@
 #!/bin/bash
-echo -e "\033[32;40m----------开始发布----------\033[0m"
+# LongLive Docker 部署脚本
+# 所有文件都在项目目录中，通过 WSL2 挂载路径访问
+# 使用方法: ./shell.sh [all|build|up|down|logs|restart]
 
-longliveDataPath="/home/docker_log/longlive"
-longliveSourcePath="/mnt/d/MyWork/Project/My/LongLive"
+echo -e "\033[32;40m========== LongLive Docker 部署 ==========\033[0m"
 
-if [ ! -d $longliveDataPath ]; then
-    sudo mkdir -p $longliveDataPath/{models,prompts,output}
-fi
+# 配置
+PROJECT_DIR="/mnt/d/MyWork/Project/My/LongLive"
+NETWORK_NAME="longlive-network"
 
-publish=0
+# 确保项目中的必要目录存在
+mkdir -p "$PROJECT_DIR"/{wan_models,inference_prompts,output}
 
-network="longlive-network"
-echo -e "\033[32;40m----------网络名称设置:$network----------\033[0m"
-
-dockercomposefile="docker-compose.yml"
-echo -e "\033[32;40m----------docker-compose文件:$dockercomposefile----------\033[0m"
+# 进入项目目录
+cd "$PROJECT_DIR"
 
 case $1 in
 "down")
-  echo -e "\033[32;40m----------停止服务----------\033[0m"
-  docker-compose -f $dockercomposefile down
+    echo -e "\033[31m🛑 停止服务...\033[0m"
+    docker-compose -f /home/docker_yml/longlive/docker-compose.yml down
+    ;;
 
-  net=$(docker network ls -f name=$network -q)
-  if [ -n "$net" ];then
-    echo -e "\033[32;40m----------删除网络----------\033[0m"
-    docker network rm $network
-  fi
-
-;;
 "up")
-  echo -e "\033[32;40m----------启动服务容器----------\033[0m"
-  docker network create $network 2>/dev/null
-  docker-compose -f $dockercomposefile up -d
+    echo -e "\033[32m🚀 启动服务...\033[0m"
+    docker network create "$NETWORK_NAME" 2>/dev/null || true
+    docker-compose -f /home/docker_yml/longlive/docker-compose.yml up -d
+    echo -e "\033[32m✓ 服务已启动\033[0m"
+    docker ps --filter "name=longlive"
+    ;;
 
-;;
 "build")
-  echo -e "\033[32;40m----------构建镜像----------\033[0m"
-  docker-compose build
+    echo -e "\033[33m🔨 构建镜像...\033[0m"
+    docker-compose -f /home/docker_yml/longlive/docker-compose.yml build --no-cache
+    echo -e "\033[32m✓ 镜像构建完成\033[0m"
+    ;;
 
-;;
-"run")
-  echo -e "\033[32;40m----------运行推理（前台）----------\033[0m"
-  docker network create $network 2>/dev/null
-  docker-compose run --rm longlive
-  ;;
+"rebuild")
+    echo -e "\033[33m🔨 重新构建镜像（使用缓存）...\033[0m"
+    docker-compose -f /home/docker_yml/longlive/docker-compose.yml build
+    echo -e "\033[32m✓ 镜像构建完成\033[0m"
+    ;;
+
+"restart")
+    echo -e "\033[33m🔄 重启服务...\033[0m"
+    docker-compose -f /home/docker_yml/longlive/docker-compose.yml restart
+    echo -e "\033[32m✓ 服务已重启\033[0m"
+    docker ps --filter "name=longlive"
+    ;;
+
+"quick")
+    echo -e "\033[33m⚡ 快速更新（复制yml + 重启容器，不重新构建镜像）...\033[0m"
+    mkdir -p /home/docker_yml/longlive
+    cp "$PROJECT_DIR/docker-compose.yml" /home/docker_yml/longlive/docker-compose.yml
+    echo -e "\033[33m📋 docker-compose.yml 已更新\033[0m"
+    docker-compose -f /home/docker_yml/longlive/docker-compose.yml down
+    echo -e "\033[32m🚀 启动服务...\033[0m"
+    docker-compose -f /home/docker_yml/longlive/docker-compose.yml up -d
+    echo -e "\033[32m✓ 快速更新完成！\033[0m"
+    docker ps --filter "name=longlive"
+    ;;
+
 "logs")
-  docker-compose -f $dockercomposefile logs -f
-;;
+    echo -e "\033[36m📋 查看日志 (Ctrl+C 退出)...\033[0m"
+    docker-compose -f /home/docker_yml/longlive/docker-compose.yml logs -f
+    ;;
+
 "all")
-  echo -e "\033[32;40m----------判断网络是否存在----------\033[0m"
-  net=$(docker network ls -f name=$network -q)
-  if [ -z "$net" ];then
-    echo -e "\033[32;40m----------创建网络----------\033[0m"
-    docker network create $network
-  fi
-  echo -e "\033[32;40m----------停止服务----------\033[0m"
-  docker-compose -f $dockercomposefile down
+    echo -e "\033[32m🚀 完整部署流程...\033[0m"
 
-  echo -e "\033[32;40m----------构建镜像----------\033[0m"
-  docker-compose build
+    # 复制 docker-compose.yml 到部署目录
+    echo -e "\033[33m📋 更新 docker-compose.yml...\033[0m"
+    mkdir -p /home/docker_yml/longlive
+    cp "$PROJECT_DIR/docker-compose.yml" /home/docker_yml/longlive/docker-compose.yml
 
-  echo -e "\033[32;40m----------启动服务----------\033[0m"
-  docker-compose -f $dockercomposefile up -d
+    echo -e "\033[33m🌐 检查网络...\033[0m"
+    docker network create "$NETWORK_NAME" 2>/dev/null || true
 
-;;
+    echo -e "\033[31m🛑 停止旧容器...\033[0m"
+    docker-compose -f /home/docker_yml/longlive/docker-compose.yml down
+
+    echo -e "\033[33m🔨 构建镜像...\033[0m"
+    docker-compose -f /home/docker_yml/longlive/docker-compose.yml build --no-cache
+
+    echo -e "\033[32m🚀 启动服务...\033[0m"
+    docker-compose -f /home/docker_yml/longlive/docker-compose.yml up -d
+
+    echo -e "\033[33m🧹 清理缓存...\033[0m"
+    docker system prune -f
+
+    echo -e "\033[32m✓ 部署完成！\033[0m"
+    docker ps --filter "name=longlive"
+    echo ""
+    echo -e "\033[36m📂 挂载目录:\033[0m"
+    echo "   wan_models           → $PROJECT_DIR/wan_models"
+    echo "   inference_prompts→ $PROJECT_DIR/inference_prompts"
+    echo "   output           → $PROJECT_DIR/output"
+    echo ""
+    echo -e "\033[36m📋 查看日志: ./shell.sh logs\033[0m"
+    ;;
+
 *)
-  publish=1
-  echo -e "\033[31;40m----------参数名称错误;支持：up(启动),down(停止),build(镜像构建),run(单次推理),logs(查看日志),all(全部)----------\033[0m"
-;;
+    echo -e "\033[31m========== 使用方法 ==========\033[0m"
+    echo "  ./shell.sh all      - 完整部署（停止+构建+启动）"
+    echo "  ./shell.sh build    - 构建镜像（无缓存）"
+    echo "  ./shell.sh rebuild  - 构建镜像（使用缓存）"
+    echo "  ./shell.sh up       - 启动服务"
+    echo "  ./shell.sh down     - 停止服务"
+    echo "  ./shell.sh restart  - 重启服务"
+    echo "  ./shell.sh quick    - 快速更新（只更新yml+重启，不构建镜像）"
+    echo "  ./shell.sh logs     - 查看日志"
+    echo -e "\033[31m================================\033[0m"
+    exit 1
+    ;;
 esac
-
-if (( $publish == 0 ));then
-   echo -e "\033[32;40m----------清理构建缓存----------\033[0m"
-   docker system prune -f
-fi
-
-echo -e "\033[32;40m----------结束发布----------\033[0m"

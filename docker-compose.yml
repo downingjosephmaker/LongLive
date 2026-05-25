@@ -1,16 +1,20 @@
 services:
   longlive:
     build:
-      context: /home/local_video/LongLive
-      dockerfile: Dockerfile
+      context: /mnt/d/MyWork/Project/My/LongLive
+      dockerfile: /mnt/d/MyWork/Project/My/LongLive/Dockerfile
     image: longlive:latest
     container_name: longlive
     ports:
       - "19521:19521"
     volumes:
-      - /home/docker_log/longlive/models:/models:ro
-      - /home/docker_log/longlive/prompts:/prompts:ro
-      - /home/docker_log/longlive/output:/output
+      # 挂载项目目录中的 wan_models（已下载模型）
+      # 挂载到 /app/wan_models 以匹配代码中的相对路径
+      - /mnt/d/MyWork/Project/My/LongLive/wan_models:/app/wan_models:ro
+      # 挂载项目目录中的 inference_prompts
+      - /mnt/d/MyWork/Project/My/LongLive/inference_prompts:/inference_prompts:ro
+      # 挂载项目目录中的 output（输出结果）
+      - /mnt/d/MyWork/Project/My/LongLive/output:/output
     environment:
       - TZ=Asia/Shanghai
       - NVIDIA_VISIBLE_DEVICES=all

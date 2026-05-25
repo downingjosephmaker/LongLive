@@ -427,6 +427,22 @@ def _run_generate(
                 return result
             _pipe.text_encoder.forward = _patched_forward
 
+            # Monkey-patch VAE decode: DiT→CPU, VAE→GPU before decode inside pipeline
+            _orig_vae_decode = _pipe.vae.decode_to_pixel
+            _vae_moved = [False]
+            def _patched_vae_decode(x):
+                if not _vae_moved[0]:
+                    print("[API] DiT sampling done, offload DiT→CPU, VAE→GPU...", flush=True)
+                    _pipe.generator.to(device='cpu')
+                    torch.cuda.empty_cache()
+                    _pipe.vae.to(device='cuda')
+                    torch.cuda.empty_cache()
+                    free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+                    print(f"[API] VAE ready on GPU, VRAM free: {free_gb:.1f}GB", flush=True)
+                    _vae_moved[0] = True
+                return _orig_vae_decode(x)
+            _pipe.vae.decode_to_pixel = _patched_vae_decode
+
         video_tensor = _pipe.inference(
             noise=noise,
             text_prompts=prompts,
@@ -438,26 +454,16 @@ def _run_generate(
 
         if need_offload:
             _pipe.text_encoder.forward = _orig_forward
-
-        # VAE decode
-        vae_on_gpu = next(_pipe.vae.parameters()).device.type == 'cuda'
-        if not vae_on_gpu:
-            print("[API] Moving VAE to GPU for decoding...", flush=True)
-            _pipe.generator.to(device='cpu')
+            _pipe.vae.decode_to_pixel = _orig_vae_decode
+            _pipe.vae.to(device='cpu')
             torch.cuda.empty_cache()
-            _pipe.vae.to(device='cuda')
-            torch.cuda.empty_cache()
+            print("[API] VAE offloaded to CPU", flush=True)
 
         filename = f"longlive_{int(time.time())}_{seed}.mp4"
         out_path = OUTPUT_DIR / filename
         print(f"[API] Saving video to {out_path}...", flush=True)
         save_video(video_tensor[0], out_path, fps=fps)
         print(f"[API] Video saved: {out_path}", flush=True)
-
-        if not vae_on_gpu:
-            _pipe.vae.to(device='cpu')
-            torch.cuda.empty_cache()
-            print("[API] VAE offloaded to CPU", flush=True)
 
     return str(out_path)
 

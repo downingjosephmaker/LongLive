@@ -12,12 +12,11 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Sequence, Optional, Tuple, List
+from typing import Sequence
 
 import torch
-import torchvision.transforms.functional as TF
-from PIL import Image
 from einops import rearrange
 from torchvision.io import write_video
 
@@ -48,6 +47,67 @@ def load_generator_checkpoint(generator, checkpoint_path: str, *, use_ema: bool 
     if strict is None:
         strict = not use_ema
     return generator.load_state_dict(state_dict, strict=strict)
+
+
+def _load_lora_state_dict(lora_ckpt_path: str) -> Mapping[str, torch.Tensor]:
+    """Load a LoRA checkpoint, unwrapping ``generator_lora`` when present."""
+    checkpoint = _torch_load(lora_ckpt_path)
+    if isinstance(checkpoint, Mapping) and "generator_lora" in checkpoint:
+        return checkpoint["generator_lora"]
+    return checkpoint
+
+
+def apply_and_merge_lora(
+    pipeline,
+    config,
+    *,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    verbose: bool = False,
+):
+    """Wrap ``pipeline.generator.model`` with a LoRA adapter, load weights, and merge.
+
+    The merged module ends up structurally identical to the original generator
+    (``nn.Linear`` layers carrying the base + LoRA delta), which is what NVFP4
+    quantization needs as its starting point.
+
+    Returns ``True`` when LoRA was applied and merged, ``False`` when the config
+    did not request a LoRA adapter.
+    """
+    adapter_cfg = getattr(config, "adapter", None)
+    lora_ckpt = getattr(config, "lora_ckpt", None)
+    if adapter_cfg is None or not lora_ckpt:
+        return False
+
+    import peft
+    from utils.lora_utils import configure_lora_for_model
+
+    if device is not None:
+        pipeline.generator.to(device=torch.device(device), dtype=dtype)
+    else:
+        pipeline.generator.to(dtype=dtype)
+
+    if verbose:
+        print(f"[LoRA] Wrapping generator with adapter config: {adapter_cfg}")
+    pipeline.generator.model = configure_lora_for_model(
+        pipeline.generator.model,
+        model_name="generator",
+        lora_config=adapter_cfg,
+        is_main_process=verbose,
+    )
+
+    if verbose:
+        print(f"[LoRA] Loading LoRA weights from: {lora_ckpt}")
+    lora_state = _load_lora_state_dict(lora_ckpt)
+    peft.set_peft_model_state_dict(pipeline.generator.model, lora_state)  # type: ignore[arg-type]
+
+    if verbose:
+        print("[LoRA] Merging LoRA delta into base weights (merge_and_unload)...")
+    pipeline.generator.model = pipeline.generator.model.merge_and_unload(safe_merge=True)
+    pipeline.generator.model.eval().requires_grad_(False)
+    pipeline.is_lora_enabled = False
+    pipeline.is_lora_merged = True
+    return True
 
 
 def place_vae_for_streaming(pipeline, config) -> torch.device | None:
@@ -81,19 +141,27 @@ def setup_nvfp4_pipeline(
     *,
     verbose: bool = False,
 ):
-    """Configure ``pipeline`` for NVFP4 inference from a merged generator checkpoint.
+    """Configure ``pipeline`` for NVFP4 inference from a generator checkpoint.
 
     Handles both supported NVFP4 backends:
 
     * ``model_quant_use_transformer_engine=True`` -> a BF16 generator checkpoint
       that gets wrapped with TransformerEngine NVFP4 modules and materialized
       after moving to ``device``.
-    * ``model_quant_use_transformer_engine=False`` -> a pre-materialized
-      FourOverSix NVFP4 state dict that is loaded directly into the
+    * ``model_quant_use_transformer_engine=False`` -> either a BF16 generator
+      checkpoint that gets quantized with FourOverSix at load time, or a
+      pre-materialized FourOverSix NVFP4 state dict loaded directly into the
       already-quantized architecture.
 
-    This helper assumes the generator checkpoint is fully merged (no LoRA
-    adapter), which matches the released NVFP4 weights.
+    Optional LoRA support (BF16 base only): when ``config.adapter`` and
+    ``config.lora_ckpt`` are both set, the LoRA adapter is loaded on the BF16
+    base generator, merged via ``merge_and_unload``, and the resulting weights
+    are then quantized — so the same yaml can swap between TE and FourOverSix
+    backends without pre-merging the LoRA checkpoint.
+
+    For materialized FourOverSix checkpoints LoRA cannot be applied (the master
+    weights have already been quantized away); ``lora_ckpt``/``adapter`` are
+    ignored in that case with a printed warning.
     """
     if not bool(getattr(config, "model_quant", False)):
         raise ValueError("setup_nvfp4_pipeline requires model_quant=true in the config.")
@@ -104,9 +172,12 @@ def setup_nvfp4_pipeline(
 
     use_te = bool(getattr(config, "model_quant_use_transformer_engine", False))
     device = torch.device(device)
+    use_ema = bool(getattr(config, "use_ema", False))
 
     checkpoint = _torch_load(generator_ckpt)
-    state_dict = unwrap_generator_state_dict(checkpoint, use_ema=bool(getattr(config, "use_ema", False)))
+    state_dict = unwrap_generator_state_dict(checkpoint, use_ema=use_ema)
+    if use_ema:
+        state_dict = clean_fsdp_state_dict_keys(state_dict)
 
     if is_te_nvfp4_checkpoint(checkpoint):
         raise ValueError(
@@ -115,8 +186,18 @@ def setup_nvfp4_pipeline(
         )
 
     is_prequantized = is_nvfp4_state_dict(state_dict)
+    has_lora_request = bool(getattr(config, "adapter", None)) and bool(getattr(config, "lora_ckpt", None))
+
+    pipeline.is_lora_enabled = False
+    pipeline.is_lora_merged = False
 
     if is_prequantized:
+        if has_lora_request and verbose:
+            print(
+                "[NVFP4] generator_ckpt is a materialized FourOverSix NVFP4 checkpoint; "
+                "ignoring lora_ckpt/adapter because the master weights are already quantized. "
+                "Use a BF16 base checkpoint if you need to load a LoRA on top."
+            )
         if use_te:
             raise ValueError(
                 "generator_ckpt is a materialized NVFP4 (FourOverSix) checkpoint; set "
@@ -134,7 +215,20 @@ def setup_nvfp4_pipeline(
         pipeline.text_encoder.to(dtype=torch.bfloat16)
         pipeline.vae.to(dtype=torch.bfloat16)
     else:
-        pipeline.generator.load_state_dict(state_dict, strict=True)
+        load_strict = not use_ema
+        pipeline.generator.load_state_dict(state_dict, strict=load_strict)
+
+        if has_lora_request:
+            # Apply + merge LoRA on the BF16 base before quantization. Move the
+            # generator to CUDA first so the TE wrapper (which requires CUDA
+            # modules) can later replace the merged Linear layers in-place.
+            apply_and_merge_lora(
+                pipeline,
+                config,
+                device=device,
+                dtype=torch.bfloat16,
+                verbose=verbose,
+            )
 
         if use_te:
             pipeline.generator.model, _ = quantize_model_for_transformer_engine_nvfp4(
@@ -165,8 +259,6 @@ def setup_nvfp4_pipeline(
     pipeline.vae.to(device=device)
     place_vae_for_streaming(pipeline, config)
 
-    pipeline.is_lora_enabled = False
-    pipeline.is_lora_merged = False
     return pipeline
 
 
@@ -198,186 +290,6 @@ def prepare_single_prompt_inputs(
         generator=generator,
     )
     return noise, prompts
-
-
-# ---------------------------------------------------------------------------
-# Image-to-Video helpers
-# ---------------------------------------------------------------------------
-
-def load_and_preprocess_image(
-    image_path: str,
-    target_width: int = 832,
-    target_height: int = 480,
-) -> Image.Image:
-    """Load an image, resize/center-crop to target dimensions.
-
-    Target dimensions are in pixel space.  They should be multiples of
-    (patch_size * vae_stride).  For Wan2.2-TI2V-5B with the default
-    LongLive config, latent shape is 48×44×80 which corresponds to
-    768×704 in pixel space.
-    """
-    img = Image.open(image_path).convert("RGB")
-    iw, ih = img.size
-
-    # Scale to fit target, maintaining aspect ratio
-    scale = max(target_width / iw, target_height / ih)
-    img = img.resize((round(iw * scale), round(ih * scale)), Image.LANCZOS)
-
-    # Center crop to exact target size
-    x1 = (img.width - target_width) // 2
-    y1 = (img.height - target_height) // 2
-    img = img.crop((x1, y1, x1 + target_width, y1 + target_height))
-
-    return img
-
-
-def image_to_tensor(img: Image.Image, device: torch.device) -> torch.Tensor:
-    """Convert PIL Image to normalised tensor on *device*.
-
-    Returns tensor of shape (3, H, W) normalised to [-1, 1].
-    """
-    tensor = TF.to_tensor(img).sub_(0.5).div_(0.5)
-    return tensor.to(device)
-
-
-def encode_image_to_latent(
-    vae_wrapper,
-    image_tensor: torch.Tensor,
-) -> torch.Tensor:
-    """Encode a single image tensor to VAE latent space.
-
-    Args:
-        vae_wrapper: ``WanVAEWrapper`` instance (``pipeline.vae``).
-        image_tensor: Shape ``(3, H, W)`` on the correct device.
-
-    Returns:
-        Tensor of shape ``(1, C, 1, h, w)`` — the first temporal dim is 1
-        because we encode a single frame.
-    """
-    # WanVAEWrapper.encode_to_latent expects (batch, C, F, H, W)
-    pixel = image_tensor.unsqueeze(0).unsqueeze(2)  # (1, 3, 1, H, W)
-    with torch.no_grad():
-        latent = vae_wrapper.encode_to_latent(pixel)  # (1, 1, C, h, w)
-    return latent
-
-
-def prepare_i2v_inputs_with_vae(
-    config,
-    prompt: str,
-    image_path: str,
-    vae,
-    device: torch.device | str,
-    *,
-    dtype: torch.dtype = torch.bfloat16,
-    seed: int = 0,
-) -> Tuple[torch.Tensor, List[List[str]], torch.Tensor]:
-    """Prepare inputs for single-image-to-video inference (with VAE instance).
-
-    Returns:
-        (noise, prompts, initial_latent)
-        - noise:     (1, num_noise_frames, C, h, w)
-        - prompts:   [[prompt, prompt, ...]] (one per chunk)
-        - initial_latent: (1, 1, C, h, w)  — the encoded first frame
-    """
-    device = torch.device(device)
-    frames_per_block = int(getattr(config, "num_frame_per_block", 1))
-    latent_shape = list(config.image_or_video_shape[2:])  # [C, h, w]
-
-    num_noise_frames = int(getattr(config, "num_output_frames", config.image_or_video_shape[1]))
-
-    if num_noise_frames % frames_per_block != 0:
-        raise ValueError(
-            f"num_output_frames={num_noise_frames} must be divisible by "
-            f"num_frame_per_block={frames_per_block}"
-        )
-
-    num_blocks = num_noise_frames // frames_per_block
-    prompts = [[prompt] * num_blocks]
-
-    # Compute pixel size from latent shape
-    pixel_h = latent_shape[1] * 8
-    pixel_w = latent_shape[2] * 8
-
-    img = load_and_preprocess_image(image_path, target_width=pixel_w, target_height=pixel_h)
-    img_tensor = image_to_tensor(img, device)
-
-    # Encode image to latent
-    initial_latent = encode_image_to_latent(vae, img_tensor)  # (1, 1, C, h, w)
-
-    # Generate noise for the remaining frames
-    seed_g = torch.Generator(device=device)
-    seed_g.manual_seed(seed)
-    noise = torch.randn(
-        [1, num_noise_frames, *latent_shape],
-        device=device,
-        dtype=dtype,
-        generator=seed_g,
-    )
-
-    return noise, prompts, initial_latent
-
-
-def prepare_bookend_i2v_inputs(
-    config,
-    prompt: str,
-    first_frame_path: str,
-    last_frame_path: str,
-    vae,
-    device: torch.device | str,
-    *,
-    dtype: torch.dtype = torch.bfloat16,
-    seed: int = 0,
-) -> Tuple[torch.Tensor, List[List[str]], torch.Tensor]:
-    """Prepare inputs for first+last frame to video inference.
-
-    Strategy: encode first frame as initial_latent (the pipeline will inject it).
-    The last frame is used as a soft guidance target during the last chunk's
-    denoising via a simple loss term that pulls the decoded last frame toward
-    the target latent.
-
-    Returns:
-        (noise, prompts, initial_latent)
-        - noise:         (1, num_noise_frames, C, h, w)
-        - prompts:       [[prompt, prompt, ...]]
-        - initial_latent: (1, 1, C, h, w)  — the encoded first frame
-
-    Note: last_frame_latent is NOT returned here because the guidance is applied
-    inside the modified pipeline call in inference_i2v.py.
-    """
-    device = torch.device(device)
-    frames_per_block = int(getattr(config, "num_frame_per_block", 1))
-    latent_shape = list(config.image_or_video_shape[2:])
-
-    num_noise_frames = int(getattr(config, "num_output_frames", config.image_or_video_shape[1]))
-
-    if num_noise_frames % frames_per_block != 0:
-        raise ValueError(
-            f"num_output_frames={num_noise_frames} must be divisible by "
-            f"num_frame_per_block={frames_per_block}"
-        )
-
-    num_blocks = num_noise_frames // frames_per_block
-    prompts = [[prompt] * num_blocks]
-
-    pixel_h = latent_shape[1] * 8
-    pixel_w = latent_shape[2] * 8
-
-    # Encode first frame
-    img_first = load_and_preprocess_image(first_frame_path, target_width=pixel_w, target_height=pixel_h)
-    tensor_first = image_to_tensor(img_first, device)
-    initial_latent = encode_image_to_latent(vae, tensor_first)  # (1, 1, C, h, w)
-
-    # Generate noise
-    seed_g = torch.Generator(device=device)
-    seed_g.manual_seed(seed)
-    noise = torch.randn(
-        [1, num_noise_frames, *latent_shape],
-        device=device,
-        dtype=dtype,
-        generator=seed_g,
-    )
-
-    return noise, prompts, initial_latent
 
 
 def video_to_uint8(video: torch.Tensor) -> torch.Tensor:

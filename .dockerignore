@@ -1,9 +1,44 @@
+# Large directories (mounted via volumes, not needed in image)
+wan_models
 models
 output
-prompts
+inference_prompts
+
+# wheels needed for Dockerfile COPY - keep this exception
+!wheels/
+
+# Python cache
 __pycache__
 *.pyc
-.git
+*.pyo
+*.egg-info
 .venv
 wandb
-*.egg-info
+
+# Git
+.git
+.gitignore
+
+# IDE / OS
+.claude
+.idea
+.vscode
+.DS_Store
+Thumbs.db
+
+# Conda / other
+environment.yml
+install_conda.bat
+start_conda.bat
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Docs
+docs
+*.md
+!README.md
+LICENSE
+CONTRIBUTING.md
