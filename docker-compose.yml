@@ -19,6 +19,12 @@ services:
       - TZ=Asia/Shanghai
       - NVIDIA_VISIBLE_DEVICES=all
       - LONGLIVE_PUBLIC_BASE=http://127.0.0.1:19521
+      - LLV2_TRITON_ADALN=0
+      - LLV2_TRITON_ROPE=0
+      - LLV2_FREQS_I_CACHE=1
+      - CUDNN_V8_API_ENABLED=1
+      - TORCH_CUDNN_V8_API_ENABLED=1
+      - PYTORCH_ALLOC_CONF=expandable_segments:True
     deploy:
       resources:
         reservations:

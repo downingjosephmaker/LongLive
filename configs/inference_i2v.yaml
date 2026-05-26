@@ -11,7 +11,7 @@ num_samples: 1
 save_latents_only: false
 
 data:
-  data_path: /prompts
+  data_path: /inference_prompts
   image_or_video_shape:
   - 1
   - 128
@@ -29,9 +29,12 @@ inference:
   async_vae: false
   vae_type: wan
   independent_first_frame: true   # Required for I2V — inject first frame at t=0
+  kv_quant: true
+  kv_quant_scale_rule: mse
+  kv_quant_backend: cuda
 
 checkpoints:
-  generator_ckpt: /models/LongLive-2.0-5B/model_bf16.pt
+  generator_ckpt: wan_models/LongLive-2.0-5B/model_bf16.pt
 
 logging:
   seed: 0

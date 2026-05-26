@@ -1,8 +1,9 @@
-opencv-python>=4.9.0.80
-diffusers==0.31.0
-transformers>=4.49.0
-tokenizers>=0.20.3
-accelerate>=1.1.1
+pillow
+opencv-python
+diffusers
+transformers
+tokenizers
+accelerate
 tqdm
 datasets
 imageio
@@ -14,21 +15,19 @@ imageio-ffmpeg
 wandb
 omegaconf
 einops
-av==13.1.0
-opencv-python
-git+https://github.com/openai/CLIP.git
+av
+# git+https://github.com/openai/CLIP.git  # 改为本地安装，见 Dockerfile
 open_clip_torch
 starlette
 pycocotools
 lmdb
 matplotlib
 sentencepiece
-pydantic==2.10.6
+pydantic
 scikit-image
-huggingface_hub[cli]
+huggingface_hub
 dominate
-# Optional TensorRT support. Install separately because nvidia-tensorrt is a
-# placeholder on PyPI and requires NVIDIA's package index to be configured first:
+# Optional TensorRT support:
 #   pip install nvidia-pyindex
 #   pip install nvidia-tensorrt
 #   pip install pycuda

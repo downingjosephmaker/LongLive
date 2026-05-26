@@ -60,6 +60,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
+
+# cuDNN 9.20.0 supports Blackwell (sm_120, RTX 5090) up to sm_121
+# Enable cuDNN for conv/VAE acceleration
+if torch.cuda.is_available():
+    _gpu_name = torch.cuda.get_device_name(0)
+    _cudnn_ver = torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else None
+    print(f"[API] GPU: {_gpu_name}, cuDNN: {_cudnn_ver}", flush=True)
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
 from fastapi import (
     FastAPI,
     File,
@@ -76,6 +86,26 @@ from pydantic import BaseModel, Field
 
 import uvicorn
 from omegaconf import OmegaConf
+
+# ---------------------------------------------------------------------------
+# Resolution & Duration presets
+# ---------------------------------------------------------------------------
+RESOLUTION_PRESETS = {
+    "480p":            {"width": 832,  "height": 480,  "label": "480p 横屏 (832×480)"},
+    "480p_portrait":   {"width": 480,  "height": 832,  "label": "480p 竖屏 (480×832)"},
+    "540p":            {"width": 960,  "height": 544,  "label": "540p 横屏 (960×544)"},
+    "540p_portrait":   {"width": 544,  "height": 960,  "label": "540p 竖屏 (544×960)"},
+    "720p":            {"width": 1280, "height": 704,  "label": "720p 横屏 (1280×704)"},
+    "720p_portrait":   {"width": 704,  "height": 1280, "label": "720p 竖屏 (704×1280)"},
+}
+
+# 单镜头时长（秒），多镜头时 total_frames = per_shot_frames × shot_count
+DURATION_PRESETS = {
+    "1s":  1.0,
+    "2s":  2.0,
+    "3s":  3.0,
+    "5s":  5.0,
+}
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -143,18 +173,21 @@ def _ensure_loaded(kind: str = "t2v"):
         print(f"[API] Loading generator checkpoint: {ckpt_path}", flush=True)
         load_generator_checkpoint(_pipe.generator, ckpt_path)
 
-    _pipe = _pipe.to(device=_device, dtype=torch.bfloat16)
+    # Load everything to CPU in bf16 first — avoid OOM from loading ALL to GPU at once
+    _pipe = _pipe.to(device='cpu', dtype=torch.bfloat16)
     place_vae_for_streaming(_pipe, _config)
     _pipe.generator.model.eval().requires_grad_(False)
 
-    # GPU offload: 全部放 CPU，推理时按需搬
+    # Selective GPU loading: DiT on GPU, T5+VAE on CPU (moved on-demand during inference)
     if torch.cuda.get_device_properties(_device).total_memory < 30 * 1024**3:
-        print(f"[API] GPU < 30GB, offloading T5 + VAE to CPU...", flush=True)
-        _pipe.text_encoder.to(device="cpu", dtype=torch.bfloat16)
-        _pipe.vae.to(device="cpu", dtype=torch.bfloat16)
+        print(f"[API] GPU < 30GB, loading DiT to GPU only (T5+VAE stay on CPU)...", flush=True)
+        _pipe.generator.to(device=_device, dtype=torch.bfloat16)
+        import gc; gc.collect()
         torch.cuda.empty_cache()
         free_gb = torch.cuda.mem_get_info()[0] / 1024**3
-        print(f"[API] Offload done, VRAM free: {free_gb:.1f}GB", flush=True)
+        print(f"[API] DiT on GPU, VRAM free: {free_gb:.1f}GB", flush=True)
+    else:
+        _pipe = _pipe.to(device=_device, dtype=torch.bfloat16)
 
     _LOADED_CONFIG_KIND = kind
     print(f"[API] Pipeline ready (kind={kind}).", flush=True)
@@ -188,9 +221,53 @@ class ShotInput(BaseModel):
 class GenerateRequest(BaseModel):
     """Unified generation request."""
     shots: List[ShotInput] = Field(..., min_length=1, description="Shots to generate")
-    num_frames: int = Field(128, description="Total latent frames (must be divisible by num_frame_per_block)")
-    seed: int = Field(0, description="Random seed (0 = pick a fresh one)")
+    resolution: str = Field("720p", description="分辨率预设 key")
+    duration: str = Field("2s", description="时长预设 key")
+    seed: int = Field(0, ge=0, le=100, description="随机种子 (0=随机, 1-100=指定)")
     fps: int = Field(24, description="Output video fps")
+
+
+def _validate_and_resolve(resolution: str, duration: str, fps: int, num_shots: int = 1):
+    """Validate preset keys and resolve to (width, height, num_frames, latent_h, latent_w).
+
+    num_frames = per_shot_frames × num_shots, where per_shot_frames = duration_seconds × fps (aligned to 8).
+    """
+    if resolution not in RESOLUTION_PRESETS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的分辨率: '{resolution}'，可选: {list(RESOLUTION_PRESETS.keys())}",
+        )
+    if duration not in DURATION_PRESETS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的时长: '{duration}'，可选: {list(DURATION_PRESETS.keys())}",
+        )
+
+    preset = RESOLUTION_PRESETS[resolution]
+    width, height = preset["width"], preset["height"]
+    per_shot_seconds = DURATION_PRESETS[duration]
+
+    latent_h = height // 16
+    latent_w = width // 16
+    # DiT patch_size=(1,2,2) requires latent H/W to be even
+    if latent_h % 2 != 0 or latent_w % 2 != 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"分辨率 {width}×{height} 的 latent 尺寸 ({latent_h}×{latent_w}) 必须均为偶数，"
+                   f"请调整为 16 的偶数倍（如 {latent_h//2*2*16}×{latent_w//2*2*16}）",
+        )
+
+    # per_shot_frames aligned to fpb(8)
+    fpb = 8
+    per_shot_frames = max(fpb, (int(per_shot_seconds * fps) // fpb) * fpb)
+    num_frames = per_shot_frames * num_shots
+    total_seconds = num_frames / fps
+
+    print(f"[API] Resolution: {width}×{height} (latent {latent_h}×{latent_w}), "
+          f"Per-shot: {per_shot_frames} frames ({per_shot_seconds:.1f}s), "
+          f"Shots: {num_shots}, Total: {num_frames} frames ({total_seconds:.1f}s @ {fps}fps)", flush=True)
+
+    return width, height, num_frames, latent_h, latent_w
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +405,8 @@ def _run_generate(
     seed: int,
     fps: int,
     image_map: Optional[Dict[str, str]] = None,
+    latent_h: int = 44,
+    latent_w: int = 80,
 ) -> str:
     """Synchronous generation — called from asyncio.to_thread.
 
@@ -358,6 +437,27 @@ def _run_generate(
         _config.num_output_frames = num_frames
     except Exception:
         pass
+
+    # ── 动态设置分辨率 ──────────────────────────────────────────────
+    # image_or_video_shape = [batch, frames, C, H_latent, W_latent]
+    orig_shape = list(_config.image_or_video_shape)
+    new_shape = [orig_shape[0], num_frames, orig_shape[2], latent_h, latent_w]
+    _config.image_or_video_shape = new_shape
+    if orig_shape[3] != latent_h or orig_shape[4] != latent_w:
+        print(f"[API] Latent shape changed: [{orig_shape[3]},{orig_shape[4]}] → [{latent_h},{latent_w}] "
+              f"(pixel {latent_h*16}×{latent_w*16})", flush=True)
+        # Resolution changed — must fully clear KV cache (size depends on frame_seq_length)
+        import math as _math
+        _pipe.frame_seq_length = _math.prod(new_shape[-2:]) // 4
+        _pipe.clear_cache()
+        torch.cuda.empty_cache()
+        if hasattr(_pipe.generator, 'model') and hasattr(_pipe.generator.model, 'block_mask'):
+            _pipe.generator.model.block_mask = None
+        try:
+            from wan_5b.modules.causal_model import _FREQS_I_CACHE
+            _FREQS_I_CACHE.clear()
+        except Exception:
+            pass
 
     image_map = image_map or {}
     block_counts = _resolve_shot_block_counts(shots, num_frames)
@@ -427,20 +527,31 @@ def _run_generate(
                 return result
             _pipe.text_encoder.forward = _patched_forward
 
-            # Monkey-patch VAE decode: DiT→CPU, VAE→GPU before decode inside pipeline
-            _orig_vae_decode = _pipe.vae.decode_to_pixel
+            # Monkey-patch VAE decode: DiT→CPU, VAE→GPU, chunk-decode to avoid OOM
             _vae_moved = [False]
             def _patched_vae_decode(x):
                 if not _vae_moved[0]:
                     print("[API] DiT sampling done, offload DiT→CPU, VAE→GPU...", flush=True)
+                    # Move ALL generator submodules to CPU
                     _pipe.generator.to(device='cpu')
+                    # Force release of any CUDA tensors still referenced
+                    import gc
+                    gc.collect()
                     torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    # Verify DiT actually left GPU
+                    free_gb = torch.cuda.mem_get_info()[0] / 1024**3
+                    total_gb = torch.cuda.mem_get_info()[1] / 1024**3
+                    print(f"[API] DiT offloaded, VRAM free: {free_gb:.1f}GB / {total_gb:.1f}GB", flush=True)
                     _pipe.vae.to(device='cuda')
                     torch.cuda.empty_cache()
                     free_gb = torch.cuda.mem_get_info()[0] / 1024**3
                     print(f"[API] VAE ready on GPU, VRAM free: {free_gb:.1f}GB", flush=True)
                     _vae_moved[0] = True
-                return _orig_vae_decode(x)
+                # Use chunked decode to limit VRAM usage
+                return _pipe.vae.decode_to_pixel_chunk(x, chunk_size=1)
             _pipe.vae.decode_to_pixel = _patched_vae_decode
 
         video_tensor = _pipe.inference(
@@ -448,13 +559,11 @@ def _run_generate(
             text_prompts=prompts,
             initial_latent=initial_latent,
             return_latents=False,
-            shot_anchors=shot_anchors if shot_anchors else None,
         )
         print(f"[API] Inference done, video_tensor shape={video_tensor.shape}", flush=True)
 
         if need_offload:
             _pipe.text_encoder.forward = _orig_forward
-            _pipe.vae.decode_to_pixel = _orig_vae_decode
             _pipe.vae.to(device='cpu')
             torch.cuda.empty_cache()
             print("[API] VAE offloaded to CPU", flush=True)
@@ -478,6 +587,8 @@ async def _run_task_in_background(
     seed: int,
     fps: int,
     image_map: Optional[Dict[str, str]] = None,
+    latent_h: int = 44,
+    latent_w: int = 80,
 ):
     """Background coroutine: wait for GPU lock then run generation."""
     state.status = TaskStatus.RUNNING
@@ -488,7 +599,7 @@ async def _run_task_in_background(
             state.progress = pct
 
         path = await asyncio.to_thread(
-            _run_generate, shots, num_frames, seed, fps, image_map
+            _run_generate, shots, num_frames, seed, fps, image_map, latent_h, latent_w
         )
         state.video_path = path
         state.status = TaskStatus.SUCCEEDED
@@ -512,12 +623,12 @@ async def _run_task_in_background(
 
 
 def _spawn_task(
-    shots, num_frames, seed, fps, image_map=None, tmp_files=None
+    shots, num_frames, seed, fps, image_map=None, tmp_files=None, latent_h=44, latent_w=80
 ) -> TaskState:
     state = TaskState(task_id=uuid.uuid4().hex[:12])
     state._tmp_files = tmp_files or []
     _register_task(state)
-    asyncio.create_task(_run_task_in_background(state, shots, num_frames, seed, fps, image_map))
+    asyncio.create_task(_run_task_in_background(state, shots, num_frames, seed, fps, image_map, latent_h, latent_w))
     return state
 
 
@@ -568,15 +679,19 @@ async def generate(
     async_: bool = Query(False, alias="async", description="Return immediately with task_id"),
 ):
     """Unified generation endpoint."""
+    width, height, num_frames, latent_h, latent_w = _validate_and_resolve(
+        req.resolution, req.duration, req.fps, len(req.shots)
+    )
     s = _pick_seed(req.seed)
 
     if async_:
-        state = _spawn_task(req.shots, req.num_frames, s, req.fps, image_map=None)
+        state = _spawn_task(req.shots, num_frames, s, req.fps, image_map=None,
+                            latent_h=latent_h, latent_w=latent_w)
         return {"status": "queued", "task_id": state.task_id}
 
     try:
         path = await asyncio.to_thread(
-            _run_generate, req.shots, req.num_frames, s, req.fps
+            _run_generate, req.shots, num_frames, s, req.fps, None, latent_h, latent_w
         )
         return {
             "status": "ok",
@@ -594,7 +709,8 @@ async def generate(
 async def generate_upload_v2(
     request: Request,
     shots_json: str = Form(...),
-    num_frames: str = Form("128"),
+    resolution: str = Form("720p"),
+    duration: str = Form("2s"),
     seed: str = Form("0"),
     fps: str = Form("24"),
     async_: bool = Query(False, alias="async", description="Return immediately with task_id"),
@@ -610,9 +726,9 @@ async def generate_upload_v2(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid shots JSON: {e}")
 
-    nf = int(num_frames)
-    s = _pick_seed(int(seed) if seed.lstrip("-").isdigit() else 0)
     f = int(fps)
+    width, height, num_frames, latent_h, latent_w = _validate_and_resolve(resolution, duration, f, len(shots))
+    s = _pick_seed(int(seed) if seed.lstrip("-").isdigit() else 0)
 
     form = await request.form()
     image_map: Dict[str, str] = {}
@@ -632,12 +748,13 @@ async def generate_upload_v2(
             image_map[value.filename] = str(dest)
 
     if async_:
-        state = _spawn_task(shots, nf, s, f, image_map, tmp_files=saved_files)
+        state = _spawn_task(shots, num_frames, s, f, image_map, tmp_files=saved_files,
+                            latent_h=latent_h, latent_w=latent_w)
         return {"status": "queued", "task_id": state.task_id}
 
     try:
         path = await asyncio.to_thread(
-            _run_generate, shots, nf, s, f, image_map
+            _run_generate, shots, num_frames, s, f, image_map, latent_h, latent_w
         )
         return {
             "status": "ok",
@@ -888,16 +1005,28 @@ textarea{resize:vertical;min-height:60px}
   <div class="card">
     <h2>🎬 生成视频</h2>
     <div class="shot-toggle">
-      <button class="active" onclick="setShotMode(1)">单镜头</button>
-      <button onclick="setShotMode(2)">双镜头</button>
-      <button onclick="setShotMode(3)">三镜头</button>
-      <button onclick="setShotMode(0)">自定义</button>
+      <button class="active" onclick="setShotMode(1,this)">单镜头</button>
+      <button onclick="setShotMode(2,this)">双镜头</button>
+      <button onclick="setShotMode(3,this)">三镜头</button>
+      <button onclick="setShotMode(0,this)">自定义</button>
     </div>
     <div class="shots-list" id="shots-list"></div>
     <div class="params-row" style="margin-top:14px">
-      <div class="form-row"><label>帧数</label><input type="number" id="num_frames" value="128" min="8" step="8"></div>
-      <div class="form-row"><label>Seed (0=随机)</label><input type="number" id="seed" value="0"></div>
-      <div class="form-row"><label>FPS</label><input type="number" id="fps" value="24" min="1" max="60"></div>
+      <div class="form-row"><label>分辨率</label><select id="resolution">
+        <option value="480p">480p 横屏 (832×480)</option>
+        <option value="480p_portrait">480p 竖屏 (480×832)</option>
+        <option value="540p">540p 横屏 (960×544)</option>
+        <option value="540p_portrait">540p 竖屏 (544×960)</option>
+        <option value="720p" selected>720p 横屏 (1280×704)</option>
+        <option value="720p_portrait">720p 竖屏 (704×1280)</option>
+      </select></div>
+      <div class="form-row"><label>单镜头时长</label><select id="duration">
+        <option value="1s">1 秒</option>
+        <option value="2s" selected>2 秒</option>
+        <option value="3s">3 秒</option>
+        <option value="5s">5 秒</option>
+      </select></div>
+      <div class="form-row"><label>随机种子 (0=随机)</label><input type="number" id="seed" value="0" min="0" max="100" title="相同 prompt + 相同种子 = 相同视频"></div>
     </div>
     <div style="margin-top:16px;display:flex;gap:8px">
       <button class="btn btn-primary" id="btn-gen" onclick="generate()">🚀 开始生成</button>
@@ -973,8 +1102,13 @@ async function unloadModel(){
 }
 
 // --- Shots ---
-function setShotMode(n){
+function setShotMode(n, btn){
   shotCount = n || 1;
+  // Update active button style
+  document.querySelectorAll('.shot-toggle button').forEach(b=>{
+    b.classList.remove('active');
+  });
+  btn.classList.add('active');
   if(n===0){
     shots.push({prompt:'',first_frame:null,blocks:null});
     shotCount = shots.length;
@@ -1007,7 +1141,6 @@ function renderShots(){
           </label>
           <span id="fname-${i}" style="font-size:12px;color:var(--dim);margin-left:6px">${s.first_frame?'✓ '+s.first_frame:''}</span>
         </div>
-        ${shots.length>1?`<div class="form-row"><label>块数</label><input type="number" id="blocks-${i}" value="${s.blocks||''}" min="1" placeholder="自动" onchange="shots[${i}].blocks=this.value?parseInt(this.value):null"></div>`:''}
       </div>
     </div>`;
   }).join('');
@@ -1028,9 +1161,10 @@ async function generate(){
   btn.disabled = true;
   btn.textContent = '⏳ 提交中...';
 
-  const numFrames = parseInt($('num_frames').value)||128;
+  const resolution = $('resolution').value;
+  const duration = $('duration').value;
   const seed = parseInt($('seed').value)||0;
-  const fps = parseInt($('fps').value)||24;
+  const fps = 24;
 
   // Check if any shot has uploaded files → use upload-v2
   const hasFiles = shots.some(s=>s._file);
@@ -1038,7 +1172,8 @@ async function generate(){
     const fd = new FormData();
     const shotsData = shots.map(s=>({prompt:s.prompt, first_frame:s.first_frame||null, blocks:s.blocks}));
     fd.append('shots_json', JSON.stringify(shotsData));
-    fd.append('num_frames', numFrames);
+    fd.append('resolution', resolution);
+    fd.append('duration', duration);
     fd.append('seed', seed);
     fd.append('fps', fps);
 
@@ -1061,7 +1196,7 @@ async function generate(){
     // JSON generate
     const body = {
       shots: shots.map(s=>({prompt:s.prompt, first_frame:s.first_frame||null, blocks:s.blocks})),
-      num_frames: numFrames, seed, fps
+      resolution, duration, seed, fps
     };
     try{
       const r = await fetch('/api/generate?async=true',{

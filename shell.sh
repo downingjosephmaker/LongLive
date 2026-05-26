@@ -50,9 +50,6 @@ case $1 in
 
 "quick")
     echo -e "\033[33m⚡ 快速更新（复制yml + 重启容器，不重新构建镜像）...\033[0m"
-    mkdir -p /home/docker_yml/longlive
-    cp "$PROJECT_DIR/docker-compose.yml" /home/docker_yml/longlive/docker-compose.yml
-    echo -e "\033[33m📋 docker-compose.yml 已更新\033[0m"
     docker-compose -f /home/docker_yml/longlive/docker-compose.yml down
     echo -e "\033[32m🚀 启动服务...\033[0m"
     docker-compose -f /home/docker_yml/longlive/docker-compose.yml up -d
@@ -67,11 +64,6 @@ case $1 in
 
 "all")
     echo -e "\033[32m🚀 完整部署流程...\033[0m"
-
-    # 复制 docker-compose.yml 到部署目录
-    echo -e "\033[33m📋 更新 docker-compose.yml...\033[0m"
-    mkdir -p /home/docker_yml/longlive
-    cp "$PROJECT_DIR/docker-compose.yml" /home/docker_yml/longlive/docker-compose.yml
 
     echo -e "\033[33m🌐 检查网络...\033[0m"
     docker network create "$NETWORK_NAME" 2>/dev/null || true
