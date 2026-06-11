@@ -1,9 +1,15 @@
 # Image-to-Video inference (single image + first/last frame modes)
+# 官方 LongLive2.0 I2V 路径：independent_first_frame + initial_latent 触发
+# clamp_i2v_first_chunk（首 chunk 每个去噪步覆写干净图像 latent 并置零其 timestep）。
 model_kwargs:
   model_name: Wan2.2-TI2V-5B
   timestep_shift: 5.0
   num_frame_per_block: 8
   local_attn_size: 32
+
+# 官方 i2v 标志（inference.py 命令行路径用它构建视频数据集；
+# api_server.py 自行编码首帧，不读此键，保留以与官方配置语义一致）。
+i2v: true
 
 use_ema: false
 output_folder: /output

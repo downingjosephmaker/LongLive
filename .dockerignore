@@ -21,6 +21,7 @@ wandb
 
 # IDE / OS
 .claude
+.codegraph
 .idea
 .vscode
 .DS_Store

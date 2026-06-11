@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-LongLive 2.0 — FastAPI Server (Async Task + Multi-shot Anchor Edition)
+LongLive 2.0 — FastAPI Server (Async Task Edition)
 
-Unified API: each shot can choose its conditioning mode (text-only or image),
-and multi-shot generation supports per-shot first-frame anchoring via the
-pipeline-level shot_anchors mechanism.
+Unified API: the first shot can be conditioned on a first-frame image (I2V via
+the official clamp_i2v_first_chunk path: independent_first_frame + initial_latent);
+remaining shots are text-conditioned. Per-shot prompts drive multi-shot videos.
 
-Base model: Wan2.2-TI2V-5B (no last-frame conditioning support — only
-first-frame i2v / multi-shot first-frame anchors are honoured).
+Base model: Wan2.2-TI2V-5B. Only the FIRST shot's first_frame is honoured —
+the official pipeline has no per-shot anchor mechanism; first_frame on later
+shots is ignored with a warning.
 
 API Endpoints
 -------------
@@ -380,13 +381,51 @@ def _resolve_shot_block_counts(shots: List[ShotInput], total_blocks: int) -> Lis
 # ---------------------------------------------------------------------------
 # Image encoding
 # ---------------------------------------------------------------------------
+# 这三个函数原先注入在 utils/inference_utils.py（魔改版），同步官方代码时被覆盖
+# 丢失过一次，故内置于本文件 —— api_server.py 之外不再携带任何自定义改动。
+from PIL import Image as _PILImage
+import torchvision.transforms.functional as _TF
+
+
+def load_and_preprocess_image(image_path: str, target_width: int, target_height: int) -> "_PILImage.Image":
+    """Load an image, scale to fill then center-crop to the target pixel size."""
+    img = _PILImage.open(image_path).convert("RGB")
+    iw, ih = img.size
+    scale = max(target_width / iw, target_height / ih)
+    img = img.resize((round(iw * scale), round(ih * scale)), _PILImage.LANCZOS)
+    x1 = (img.width - target_width) // 2
+    y1 = (img.height - target_height) // 2
+    return img.crop((x1, y1, x1 + target_width, y1 + target_height))
+
+
+def image_to_tensor(img: "_PILImage.Image", device: torch.device) -> torch.Tensor:
+    """Convert PIL Image to a (3, H, W) tensor normalised to [-1, 1]."""
+    return _TF.to_tensor(img).sub_(0.5).div_(0.5).to(device)
+
+
+def encode_image_to_latent(vae_wrapper, image_tensor: torch.Tensor) -> torch.Tensor:
+    """Encode one image tensor to a single-frame VAE latent of shape (1, 1, C, h, w)."""
+    pixel = image_tensor.unsqueeze(0).unsqueeze(2)  # (1, 3, 1, H, W)
+    with torch.no_grad():
+        return vae_wrapper.encode_to_latent(pixel)
+
+
 def _encode_frame(image_path: str) -> torch.Tensor:
-    """Load image, preprocess, encode to VAE latent."""
-    from utils.inference_utils import load_and_preprocess_image, image_to_tensor, encode_image_to_latent
-    img = load_and_preprocess_image(image_path)
-    tensor = image_to_tensor(img, _device)
+    """Load image, preprocess to the active latent resolution, encode to VAE latent.
+
+    官方 clamp_i2v_first_chunk 路径要求 initial_latent 恰为 1 个 latent 帧，
+    且空间尺寸必须与 noise latent 一致，故目标像素尺寸从当前 config 推导。
+    """
+    shape = list(_config.image_or_video_shape)
+    target_h, target_w = shape[3] * 16, shape[4] * 16
+    img = load_and_preprocess_image(image_path, target_width=target_w, target_height=target_h)
+    try:
+        vae_device = next(_pipe.vae.parameters()).device
+    except StopIteration:
+        vae_device = _device
+    tensor = image_to_tensor(img, vae_device).to(dtype=torch.bfloat16)
     latent = encode_image_to_latent(_pipe.vae, tensor)
-    return latent
+    return latent.to(device=_device, dtype=torch.bfloat16)
 
 
 def _resolve_img(value: str, image_map: Optional[Dict[str, str]]) -> str:
@@ -412,11 +451,11 @@ def _run_generate(
 
     Follows the official LongLive 2.0 inference contract documented in README.md:
         noise, prompts = prepare_single_prompt_inputs(config, prompt, device)
-        video = pipe.inference(noise=noise, text_prompts=prompts)
+        video = pipe.inference(noise=noise, text_prompts=prompts, initial_latent=...)
         save_video(video[0], path, fps=24)
 
-    Multi-shot extensions (shot_anchors + per-shot prompt list) are wired into
-    pipe.inference()'s `shot_anchors` / `text_prompts` kwargs.
+    I2V: shot 0 的 first_frame 编码为 initial_latent，由官方 clamp_i2v_first_chunk
+    路径在首 chunk 各去噪步覆写干净 latent。多镜头通过 per-shot prompt 列表实现。
     """
     from utils.inference_utils import prepare_single_prompt_inputs, save_video
 
@@ -461,14 +500,11 @@ def _run_generate(
 
     image_map = image_map or {}
     block_counts = _resolve_shot_block_counts(shots, num_frames)
-    shot_anchors = []
-    current_chunk = 0
-    for i, (shot, blocks) in enumerate(zip(shots, block_counts)):
-        if i > 0 and shot.first_frame:  # shot 0 用 initial_latent 路径，多镜头用 anchor
-            path = _resolve_img(shot.first_frame, image_map)
-            latent = _encode_frame(path)
-            shot_anchors.append({"chunk_index": current_chunk, "latent": latent})
-        current_chunk += blocks
+    # 官方 pipeline 没有逐镜头锚帧机制：仅 shot 0 的 first_frame 经 initial_latent
+    # 生效，后续镜头的 first_frame 忽略并警告（不再做无效的 VAE 编码）。
+    for i, shot in enumerate(shots):
+        if i > 0 and shot.first_frame:
+            print(f"[API] WARN: 镜头 {i+1} 的 first_frame 被忽略——官方 pipeline 仅支持首镜头 I2V", flush=True)
 
     # 第一镜头 prompt 当 base prompt 给 prepare_single_prompt_inputs，按 num_blocks 平铺
     base_prompt = shots[0].prompt if shots else ""
@@ -595,9 +631,6 @@ async def _run_task_in_background(
     state.started_at = time.time()
     state.seed = seed
     try:
-        def _progress_cb(pct: int) -> None:
-            state.progress = pct
-
         path = await asyncio.to_thread(
             _run_generate, shots, num_frames, seed, fps, image_map, latent_h, latent_w
         )
@@ -653,7 +686,7 @@ async def status():
     """Return server and GPU status."""
     info: Dict[str, Any] = {
         "service": "LongLive 2.0 API",
-        "version": "2.0.2",
+        "version": "2.1.0",
         "model_loaded": _pipe is not None,
         "output_dir": str(OUTPUT_DIR),
         "public_base": PUBLIC_BASE or None,
@@ -1136,10 +1169,11 @@ function renderShots(){
       <div class="form-row"><label>提示词</label><textarea id="prompt-${i}" placeholder="描述画面内容..." oninput="shots[${i}].prompt=this.value">${s.prompt}</textarea></div>
       <div class="form-inline">
         <div class="form-row"><label>首帧图片</label>
-          <label class="file-label" id="flabel-${i}">📷 选择图片
+          ${i===0?`<label class="file-label" id="flabel-${i}">📷 选择图片
             <input type="file" accept="image/*" onchange="handleFile(${i},this)">
           </label>
-          <span id="fname-${i}" style="font-size:12px;color:var(--dim);margin-left:6px">${s.first_frame?'✓ '+s.first_frame:''}</span>
+          <span id="fname-${i}" style="font-size:12px;color:var(--dim);margin-left:6px">${s.first_frame?'✓ '+s.first_frame:''}</span>`
+          :`<span style="font-size:12px;color:var(--dim)">仅首镜头支持首帧图片（官方 I2V 路径）</span>`}
         </div>
       </div>
     </div>`;

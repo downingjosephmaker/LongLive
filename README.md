@@ -4,13 +4,14 @@
 
 # 🎬 LongLive 2.0: An NVFP4 Parallel Infrastructure for Long Video Generation
 
-[![Paper](https://img.shields.io/badge/ArXiv-Paper-brown)](https://arxiv.org/abs/2605.18739)
-[![Code](https://img.shields.io/badge/GitHub-Code-blue)](https://github.com/NVlabs/LongLive)
+[![Paper](https://img.shields.io/badge/Paper-LongLive_2.0-brown)](https://arxiv.org/abs/2605.18739)
+[![Paper](https://img.shields.io/badge/Paper-LongLive_1.0-orange)](https://github.com/NVlabs/LongLive/tree/v1.0)
+[![Paper](https://img.shields.io/badge/Paper-LongLive_RAG-yellow)](https://github.com/qixinhu11/LongLive-RAG)
 [![Video](https://img.shields.io/badge/YouTube-Video-red)](https://www.youtube.com/watch?v=7oQALy32fiU)
-[![Models](https://img.shields.io/badge/Model-BF16-yellow)](https://huggingface.co/Efficient-Large-Model/LongLive-2.0-5B)
-[![Models](https://img.shields.io/badge/Model-NVFP4-orange)](https://huggingface.co/Efficient-Large-Model/LongLive-2.0-5B-NVFP4-S4)
-[![Demo](https://img.shields.io/badge/Demo-Page-brightgreen)](https://nvlabs.github.io/LongLive/LongLive2/)
-[![Docs](https://img.shields.io/badge/Full-Documentation-green)](https://nvlabs.github.io/LongLive/LongLive2/docs/)
+[![Code](https://img.shields.io/badge/GitHub-Code-blue)](https://github.com/NVlabs/LongLive)
+[![Demo](https://img.shields.io/badge/Demo-Page-green)](https://nvlabs.github.io/LongLive/LongLive2/)
+[![Docs](https://img.shields.io/badge/Full-Documentation-brightgreen)](https://nvlabs.github.io/LongLive/LongLive2/docs/)
+
 
 <div align="center">
 
@@ -27,6 +28,8 @@
 </p>
 
 ## News
+- 🔥 [2026.06.01] We released [LongLive-RAG](https://github.com/qixinhu11/LongLive-RAG), a general retrieval-augmented framework for long video gen.
+- 🔥 [2026.05.30] LongLive2.0 now supports I2V AR teacher-forcing training and I2V DMD distillation for Wan2.2-TI2V-5B.
 - ⚡ [2026.05.25] We optimized the NVFP4 inference path with fused Triton RoPE/adaLN kernels, reduced KV-cache synchronization overhead, in-place quantized KV-cache updates, faster FP4 KV dequantization, pinned VAE transfers, and safer LoRA-before-quantization setup, improving overall throughput by **18.6%**.
 - 🔥 [2026.05.13] We release **LongLive 2.0**, infra with NVFP4, parallelism and multi-shot for AR training, DMD distillation, and inference (⚡45.7 FPS). The original LongLive 1.0 is now in the [v1.0](https://github.com/NVlabs/LongLive/tree/v1.0) branch.
 - 🔥 [2026.04.12] LongLive supports kv cache compression with [TriAttention](https://github.com/WeianMao/triattention), with 50% KV reduction and no quality drop. Check it [here](https://github.com/WeianMao/triattention/tree/main/longlive)
@@ -41,8 +44,8 @@
 
 **LongLive 2.0**: an NVFP4 Parallel Infrastructure for Long Video Generation
 - For training, it supports
-  - [x] Balanced sequence parallel for AR training (teacher-forcing).
-  - [x] AR training on multi-shot (or single-shot) videos. 
+  - [x] Balanced sequence parallel for T2V/I2V AR training (teacher-forcing).
+  - [x] T2V/I2V AR training on multi-shot (or single-shot) videos.
   - [x] NVFP4 (or BF16) for both AR training and few-step distillation.
 - For inference, it supports
   - [x] NVFP4 inference (W4A4) and NVFP4 KV Cache.
@@ -68,7 +71,7 @@
 - [Full Documentation](https://nvlabs.github.io/LongLive/LongLive2/docs/)
 - [Installation](https://nvlabs.github.io/LongLive/LongLive2/docs/#installation)
 - [NVFP4 Setup](https://nvlabs.github.io/LongLive/LongLive2/docs/#nvfp4-installation)
-- [Training](https://nvlabs.github.io/LongLive/LongLive2/docs/#training)
+- [Training Modes](https://nvlabs.github.io/LongLive/LongLive2/docs/#training)
 - [Inference](https://nvlabs.github.io/LongLive/LongLive2/docs/#inference)
 - [Data Organization](https://nvlabs.github.io/LongLive/LongLive2/docs/#training-data)
 
@@ -141,6 +144,44 @@ video = pipe.inference(noise=noise, text_prompts=prompts)
 save_video(video[0], "videos/quickstart/sample_nvfp4.mp4", fps=24)
 ```
 
+## Training Modes
+
+LongLive2.0 supports both T2V and I2V training. Each modality follows the same two-stage recipe: AR teacher-forcing training first, then DMD distillation from the AR checkpoint.
+
+### T2V Training
+
+```bash
+torchrun --standalone --nnodes=1 --nproc_per_node=8 train.py \
+  --config_path configs/train_ar.yaml \
+  --logdir logs/train_ar \
+  --wandb-save-dir wandb \
+  --disable-wandb
+
+torchrun --standalone --nnodes=1 --nproc_per_node=8 train.py \
+  --config_path configs/train_dmd.yaml \
+  --logdir logs/train_dmd \
+  --wandb-save-dir wandb \
+  --disable-wandb
+```
+
+### I2V Training
+
+```bash
+torchrun --standalone --nnodes=1 --nproc_per_node=8 train.py \
+  --config_path configs/train_i2v_ar.yaml \
+  --logdir logs/train_i2v_ar \
+  --wandb-save-dir wandb \
+  --disable-wandb
+
+torchrun --standalone --nnodes=1 --nproc_per_node=8 train.py \
+  --config_path configs/train_i2v_dmd.yaml \
+  --logdir logs/train_i2v_dmd \
+  --wandb-save-dir wandb \
+  --disable-wandb
+```
+
+For I2V configs, set `algorithm.i2v: true` and `algorithm.independent_first_frame: true`. `data.image_or_video_shape[1]` is the full latent sequence length, for example `96`, not `96 + 1`: the clean image latent replaces the first latent during denoising and that first latent is masked out of the training loss. For I2V DMD, set `checkpoints.generator_ckpt` to the I2V AR checkpoint used to initialize the student.
+
 ## Models
 
 | Model | FPS ↑ | Params | VBench ↑ | Multi-shot |
@@ -160,7 +201,7 @@ Please consider citing our work if you find them useful:
 @article{longlive_2.0,
   title={LongLive2.0: An NVFP4 Parallel Infrastructure for Long Video Generation},
   author={Chen, Yukang and Wang, Luozhou and Huang, Wei and Yang, Shuai and Zhang, Bohan and Xiao, Yicheng and Chu, Ruihang and Mao, Weian and Hu, Qixin and Liu, Shaoteng and Zhao, Yuyang and Mao, Huizi and Chen, Ying-Cong and Xie, Enze and Qi, Xiaojuan and Han, Song},
-  journal={arXiv preprint arXiv},
+  journal={arXiv preprint arXiv: 2605.18739},
   year={2026}
 }
 ```
@@ -171,6 +212,15 @@ Please consider citing our work if you find them useful:
     author={Yang, Shuai and Huang, Wei and Chu, Ruihang and Xiao, Yicheng and Zhao, Yuyang and Wang, Xianbang and Li, Muyang and Xie, Enze and Chen, Yingcong and Lu, Yao and others},
     booktitle={ICLR},
     year={2026},
+}
+```
+
+```bibtex
+@article{longlive_rag,
+  title         = {LongLive-RAG: A General Retrieval-Augmented Framework for Long Video Generation},
+  author        = {Hu, Qixin and Yang, Shuai and Huang, Wei and Han, Song and Chen, Yukang},
+  journal       = {arXiv preprint arXiv:2606.02553},
+  year          = {2026}
 }
 ```
 

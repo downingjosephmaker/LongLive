@@ -13,9 +13,9 @@ LongLive 2.0 提供统一的视频生成 API，能力如下：
 |------|------|
 | **T2V** 文本生视频 | 纯文本 prompt 生成视频 |
 | **I2V** 图生视频 | 一张首帧 + 文本 prompt 生成视频 |
-| **Multi-shot** 多镜头长视频 | 多个镜头连续生成，**每个镜头可独立指定 first_frame 做视觉锚定** |
+| **Multi-shot** 多镜头长视频 | 多个镜头连续生成，每镜头独立 prompt；**仅首镜头支持 first_frame** |
 
-**核心设计**：每个镜头（shot）通过 prompt + 可选 first_frame 独立控制。多镜头通过 shots 数组组合，每个 shot 的 first_frame 都会作为该镜头起点注入 diffusion（shot anchor），shot 边界由 `multi_shot_sink` 机制管理 KV cache 与 RoPE 相位。
+**核心设计**：每个镜头（shot）通过独立 prompt 控制。**仅 shot[0] 的 first_frame 生效**——经官方 I2V 路径（`independent_first_frame` + `initial_latent`，首 chunk 各去噪步覆写干净图像 latent）注入；后续镜头的 first_frame 会被忽略并在日志中警告。shot 边界由 `multi_shot_sink` 机制管理 KV cache 与 RoPE 相位。
 
 **异步模式**：所有生成接口支持 `?async=true` 切换为任务模式，立即返回 task_id，客户端通过 `GET /api/task/{id}` 轮询，避免同步连接挂死。
 
@@ -32,7 +32,7 @@ GET /api/status
 ```json
 {
   "service": "LongLive 2.0 API",
-  "version": "2.0.2",
+  "version": "2.1.0",
   "model_loaded": true,
   "output_dir": "/output",
   "public_base": "http://127.0.0.1:19521",
@@ -62,8 +62,9 @@ Content-Type: application/json
 | 字段 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `shots` | Shot[] | ✅ | — | 镜头数组，至少 1 个 |
-| `num_frames` | int | ❌ | 128 | 总 latent 帧数（必须能被 `num_frame_per_block=8` 整除） |
-| `seed` | int | ❌ | 0 | 随机种子（0 = 自动生成） |
+| `resolution` | string | ❌ | "720p" | 分辨率预设：`480p` / `480p_portrait` / `540p` / `540p_portrait` / `720p` / `720p_portrait` |
+| `duration` | string | ❌ | "2s" | 单镜头时长预设：`1s` / `2s` / `3s` / `5s`（多镜头总时长 = 单镜头时长 × 镜头数） |
+| `seed` | int | ❌ | 0 | 随机种子，范围 0–100（0 = 自动生成） |
 | `fps` | int | ❌ | 24 | 输出视频帧率 |
 
 **Shot 对象：**
@@ -71,7 +72,7 @@ Content-Type: application/json
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `prompt` | string | ✅ | 文本描述 |
-| `first_frame` | string | ❌ | 首帧图片路径（容器内路径）。**shot[0]** 用作 i2v 起点；**shot[i>0]** 作为该镜头的 shot anchor 注入 diffusion |
+| `first_frame` | string | ❌ | 首帧图片路径（容器内路径）。**仅 shot[0] 生效**（官方 I2V 路径）；shot[i>0] 填写会被忽略并警告 |
 | `blocks` | int | ❌ | 该镜头占用的 block 数（默认自动均分） |
 
 ---
@@ -87,8 +88,9 @@ Content-Type: multipart/form-data
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `shots_json` | string | ✅ | shots 数组的 JSON 字符串 |
-| `num_frames` | string | ❌ | 总帧数，默认 "128" |
-| `seed` | string | ❌ | 随机种子，默认 "0" |
+| `resolution` | string | ❌ | 分辨率预设，默认 "720p" |
+| `duration` | string | ❌ | 单镜头时长预设，默认 "2s" |
+| `seed` | string | ❌ | 随机种子（0–100），默认 "0" |
 | `fps` | string | ❌ | 帧率，默认 "24" |
 | `img_{name}` | file | ❌ | 图片文件，name 对应 shot 中 `first_frame` 的值 |
 
@@ -107,7 +109,8 @@ curl -X POST http://localhost:19521/api/generate \
     "shots": [
       {"prompt": "A compact silver robot walks through a clean robotics lab."}
     ],
-    "num_frames": 128,
+    "resolution": "720p",
+    "duration": "5s",
     "seed": 42
   }'
 ```
@@ -141,7 +144,8 @@ curl -X POST http://localhost:19521/api/generate \
         "first_frame": "/prompts/robot_standing.jpg"
       }
     ],
-    "num_frames": 128,
+    "resolution": "720p",
+    "duration": "5s",
     "seed": 42
   }'
 ```
@@ -152,7 +156,8 @@ curl -X POST http://localhost:19521/api/generate \
 curl -X POST http://localhost:19521/api/generate/upload-v2 \
   -F 'shots_json=[{"prompt":"A silver robot walks forward, examining equipment.","first_frame":"robot.png"}]' \
   -F "img_robot.png=@/path/to/robot_standing.jpg" \
-  -F "num_frames=128" \
+  -F "resolution=720p" \
+  -F "duration=5s" \
   -F "seed=42"
 ```
 
@@ -174,15 +179,16 @@ curl -X POST http://localhost:19521/api/generate \
       {"prompt": "The robot picks up a small component and inspects it closely."},
       {"prompt": "The robot places the component down and turns toward the camera."}
     ],
-    "num_frames": 256,
+    "resolution": "720p",
+    "duration": "2s",
     "seed": 42
   }'
 ```
 
-> 4 个镜头共 256 帧，自动均分每镜头 8 个 block（256 ÷ 8 ÷ 4）。
+> 4 个镜头，每镜头 2s 时长，总帧数 = 单镜头帧数 × 4，blocks 自动均分。
 > 服务端会自动在 shot[i>0] 的第一个 block prompt 前加 `"The scene transitions. "` 前缀，触发 `multi_shot_sink` 的 KV recache 与 RoPE 相位偏移。
 
-#### 场景 B：每个镜头都用独立首帧锚定（推荐）
+#### 场景 B：首镜头图片锚定 + 多镜头续写（I2V 多镜头）
 
 ```bash
 curl -X POST http://localhost:19521/api/generate \
@@ -196,35 +202,35 @@ curl -X POST http://localhost:19521/api/generate \
       },
       {
         "prompt": "Robot walks along the workbench",
-        "first_frame": "/prompts/shot1.jpg",
         "blocks": 8
       },
       {
         "prompt": "Robot interacts with a terminal",
-        "first_frame": "/prompts/shot2.jpg",
         "blocks": 8
       }
     ],
-    "num_frames": 192,
+    "resolution": "720p",
+    "duration": "2s",
     "seed": 42
   }'
 ```
 
-每个 shot 的 `first_frame` 都会被编码成 latent 并在对应 chunk 起点注入 diffusion —— 这样不同镜头视觉一致性大幅提升，shot 边界由 pipeline 的 multi_shot_sink + RoPE offset 接管。
+仅 shot[0] 的 `first_frame` 会被编码成 `initial_latent` 并经官方 clamp 路径锚定首 chunk；
+后续镜头由各自 prompt 驱动，视觉连续性由 KV cache 上下文 + multi_shot_sink + RoPE offset 接管。
+**注意**：在 shot[i>0] 上填写 `first_frame` 不会报错，但会被忽略（服务端日志输出 WARN）。
 
-#### 场景 C：上传模式 + 多镜头锚定
+#### 场景 C：上传模式 + 首镜头锚定
 
 ```bash
 curl -X POST http://localhost:19521/api/generate/upload-v2 \
   -F 'shots_json=[
     {"prompt":"Robot enters lab","first_frame":"s0.jpg","blocks":8},
-    {"prompt":"Robot walks to workbench","first_frame":"s1.jpg","blocks":8},
-    {"prompt":"Robot picks up component","first_frame":"s2.jpg","blocks":8}
+    {"prompt":"Robot walks to workbench","blocks":8},
+    {"prompt":"Robot picks up component","blocks":8}
   ]' \
   -F "img_s0.jpg=@/path/to/shot0_enter.jpg" \
-  -F "img_s1.jpg=@/path/to/shot1_walk.jpg" \
-  -F "img_s2.jpg=@/path/to/shot2_pickup.jpg" \
-  -F "num_frames=192" \
+  -F "resolution=720p" \
+  -F "duration=2s" \
   -F "seed=42"
 ```
 
@@ -296,12 +302,12 @@ curl -O http://localhost:19521/output/gen_seed42_1747800000.mp4
 
 ## 6. 参数说明
 
-### num_frames（总帧数）
+### resolution / duration（分辨率与时长预设）
 
-- 必须能被 `num_frame_per_block`（默认 8）整除
-- 推荐值：128（约 5 秒）、256（约 10 秒）、512（约 20 秒）
-- 帧数越多，生成时间越长，显存占用越高
-- 128 latent frames ≈ 5 秒 @ 24fps
+- `resolution`：6 种预设（480p/540p/720p 各含横竖屏），决定输出像素尺寸与 latent 尺寸
+- `duration`：单镜头时长（1s/2s/3s/5s），服务端换算为帧数并自动对齐 `num_frame_per_block=8`
+- 多镜头时总帧数 = 单镜头帧数 × 镜头数
+- 分辨率/帧数越大，生成时间越长，显存占用越高
 
 ### blocks（每镜头的 block 数）
 
@@ -315,7 +321,7 @@ curl -O http://localhost:19521/output/gen_seed42_1747800000.mp4
     {"prompt": "结尾定格", "blocks": 4}
   ]}
   ```
-  以上示例：4 + 12 + 4 = 20 blocks → num_frames = 160
+  以上示例：4 + 12 + 4 = 20 blocks → 总 latent 帧数 160
 
 ### seed
 
@@ -326,8 +332,8 @@ curl -O http://localhost:19521/output/gen_seed42_1747800000.mp4
 ### 图片要求
 
 - 格式：JPG / PNG / WEBP
-- 分辨率会自动 resize 到模型需要的尺寸（768×704）
-- 建议提供接近 16:9 比例的图片，避免严重裁切
+- 自动缩放并中心裁剪到所选 `resolution` 预设的像素尺寸
+- 建议提供与所选分辨率比例接近的图片，避免严重裁切
 
 ---
 
@@ -348,7 +354,7 @@ curl -O http://localhost:19521/output/gen_seed42_1747800000.mp4
 {"detail": "Video not found"}
 ```
 
-**建议：** 遇到 OOM（显存不足），减小 `num_frames` 或减少镜头数量。
+**建议：** 遇到 OOM（显存不足），降低 `resolution`、缩短 `duration` 或减少镜头数量。
 
 ---
 
@@ -542,16 +548,16 @@ AiNet `VideoGenResult` 字段映射：
 | 字段 / 模式 | API 行为 | Pipeline 真实行为 |
 |------------|---------|--------------------|
 | `shots[i].prompt` | ✅ | ✅ 每个镜头 prompt 按 block_counts 重复并按序拼接 |
-| `shots[0].first_frame` | ✅ | ✅ 编码为 `initial_latent` 注入 diffusion，t=0 锚定 |
-| `shots[i>0].first_frame` | ✅ | ✅ 编码为 `shot_anchors[i].latent`，在对应 chunk 起点注入 noise，**真正生效** |
+| `shots[0].first_frame` | ✅ | ✅ 编码为 `initial_latent`，经官方 `clamp_i2v_first_chunk` 路径在首 chunk 各去噪步覆写干净 latent 并置零其 timestep，**真正生效** |
+| `shots[i>0].first_frame` | ⚠️ 接受但忽略 | ❌ 官方 pipeline 无逐镜头锚帧机制，服务端日志输出 WARN |
 | `shots[i].blocks` | ✅ | ✅ 控制每个镜头占用的 block 数（决定时长） |
 | `last_frame` | ❌ | ❌ **wan_5b 基座不支持尾帧条件，已移除该字段** |
 
 **多镜头工作机理**：
 
-1. api_server 编码每个 shot 的 `first_frame` → shot_anchors 列表
+1. shot[0] 若带 `first_frame`，api_server 编码为 `initial_latent` 传入 `pipe.inference()`
 2. 自动在 shot[i>0] 第一个 block 的 prompt 前加 `"The scene transitions. "` 触发 shot boundary
-3. pipeline `_inference_inner` 进入新 chunk 时，把对应 shot anchor 替换 noise 第一帧
+3. pipeline 首 chunk 内每个去噪步执行 `_overwrite_i2v_context`（覆写干净图像 latent + timestep 置零）
 4. `_is_scene_cut` 触发 `_zero_kv_data` + `_pin_current_chunk`，KV cache 干净重启
 5. `multi_shot_rope_offset` 按 shot 索引偏移 RoPE 相位，时间一致性强化
 
