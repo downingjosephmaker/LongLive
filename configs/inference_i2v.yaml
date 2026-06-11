@@ -35,7 +35,9 @@ inference:
   async_vae: false
   vae_type: wan
   independent_first_frame: true   # Required for I2V — inject first frame at t=0
-  kv_quant: true
+  # kv_quant 仅供 nvfp4 量化部署（configs/nvfp4/*），需要新版 fouroversix；
+  # bf16 checkpoint (model_bf16.pt) 必须关闭，与 inference.yaml 保持一致
+  kv_quant: false
   kv_quant_scale_rule: mse
   kv_quant_backend: cuda
 

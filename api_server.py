@@ -133,10 +133,20 @@ _TASK_LOCK = asyncio.Lock()
 _LOADED_CONFIG_KIND: Optional[str] = None  # "t2v" | "i2v"
 
 def _ensure_loaded(kind: str = "t2v"):
-    """Load model on first call. kind selects T2V vs I2V config (different
-    independent_first_frame setting). Reload pipeline if kind changes."""
+    """Load model on first call. kind selects T2V vs I2V mode.
+
+    两份 config（inference.yaml / inference_i2v.yaml）共用同一模型与 checkpoint，
+    在本服务使用的字段中仅 independent_first_frame 不同，且该值只在
+    pipeline.inference() 的运行时分支使用——因此 kind 切换只翻转属性，
+    绝不重载模型（进程内重载需短暂容纳两份权重，会耗尽内存触发 OOM）。
+    """
     global _pipe, _config, _device, _LOADED_CONFIG_KIND
     if _pipe is not None and _LOADED_CONFIG_KIND == kind:
+        return
+    if _pipe is not None:
+        _pipe.independent_first_frame = (kind == "i2v")
+        _LOADED_CONFIG_KIND = kind
+        print(f"[API] Pipeline kind switched to {kind} (no reload)", flush=True)
         return
 
     sys.path.insert(0, os.getcwd())
@@ -153,15 +163,6 @@ def _ensure_loaded(kind: str = "t2v"):
                   or os.environ.get("LONGLIVE_CONFIG", None) \
                   or default_cfg
     print(f"[API] Building pipeline (kind={kind}, config={config_path})...", flush=True)
-
-    # 旧 pipeline 释放
-    if _pipe is not None:
-        del _pipe
-        _pipe = None
-        try:
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
 
     _config = normalize_config(OmegaConf.load(config_path))
     _device = torch.device("cuda")
@@ -590,16 +591,23 @@ def _run_generate(
                 return _pipe.vae.decode_to_pixel_chunk(x, chunk_size=1)
             _pipe.vae.decode_to_pixel = _patched_vae_decode
 
-        video_tensor = _pipe.inference(
-            noise=noise,
-            text_prompts=prompts,
-            initial_latent=initial_latent,
-            return_latents=False,
-        )
+        try:
+            video_tensor = _pipe.inference(
+                noise=noise,
+                text_prompts=prompts,
+                initial_latent=initial_latent,
+                return_latents=False,
+            )
+        finally:
+            if need_offload:
+                # 移除实例属性以恢复类方法。不能赋值 _orig_forward（bound method）：
+                # 那会留下 module→__dict__→bound method→module 的循环引用，
+                # 旧 pipeline 无法被引用计数回收，kind 切换重载时内存翻倍触发 OOM
+                _pipe.text_encoder.__dict__.pop("forward", None)
+                _pipe.vae.__dict__.pop("decode_to_pixel", None)
         print(f"[API] Inference done, video_tensor shape={video_tensor.shape}", flush=True)
 
         if need_offload:
-            _pipe.text_encoder.forward = _orig_forward
             _pipe.vae.to(device='cpu')
             torch.cuda.empty_cache()
             print("[API] VAE offloaded to CPU", flush=True)
